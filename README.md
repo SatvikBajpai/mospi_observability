@@ -69,6 +69,31 @@ tail -f archive/archive.log
 ssh jaeger 'hostname; uptime'
 ```
 
+## Server-side archiver (redundancy)
+
+The same `archive_traces.py` also runs on the Jaeger host (`ubun@10.24.89.149`) under a systemd user timer. This is important because Jaeger's all-in-one container uses in-memory storage — every container restart wipes traces. The two archivers (local + server) are independent backups of the same stream.
+
+Install on a fresh server:
+
+```bash
+scp archive_traces.py jaeger:~/observability/
+scp systemd/jaeger-archiver.service jaeger:~/.config/systemd/user/
+scp systemd/jaeger-archiver.timer   jaeger:~/.config/systemd/user/
+ssh jaeger 'loginctl enable-linger ubun; \
+            systemctl --user daemon-reload; \
+            systemctl --user enable --now jaeger-archiver.timer; \
+            systemctl --user list-timers jaeger-archiver.timer'
+```
+
+Inspect server-side state:
+
+```bash
+ssh jaeger 'systemctl --user status jaeger-archiver.service --no-pager'
+ssh jaeger 'cat ~/observability/archive/state.json'
+ssh jaeger 'tail ~/observability/archive/archive.log'
+ssh jaeger 'wc -l ~/observability/archive/traces.jsonl'
+```
+
 ## Initial seed
 
 If you have a one-shot dump (`all_traces.json`) and want to seed `archive/traces.jsonl` from it, run:

@@ -1,0 +1,12 @@
+[Unit]
+Description=Jaeger trace archiver (incremental)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/ubun/observability
+Environment=JAEGER_URL=http://localhost:16686
+Environment=JAEGER_SERVICE=mospi-mcp-server
+Environment=LOOKBACK_HOURS=24
+Environment=PER_OP_LIMIT=5000
+Environment=HTTP_TIMEOUT=180
+ExecStart=/usr/bin/python3 /home/ubun/observability/archive_traces.py
