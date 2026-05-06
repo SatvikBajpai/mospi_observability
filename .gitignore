@@ -11,3 +11,9 @@ venv/
 
 # macOS files
 .DS_Store
+
+# Trace data — never commit (large, may contain user query text / IPs)
+all_traces.json
+traces.jsonl
+*.jsonl
+archive/
