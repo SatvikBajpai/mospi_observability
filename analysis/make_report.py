@@ -103,20 +103,81 @@ with open(P) as f:
                     print(line); break
 """
 
+REMOTE_ACTIVE_DATES = r"""
+import json, os
+from datetime import datetime, timezone, timedelta
+TZ = timezone(timedelta(hours=5, minutes=30))
+P = os.path.expanduser({path!r})
+EXCLUDED = {{"health check", "healthcheck", "ping", "test"}}
+days = set()
+with open(P) as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try: t = json.loads(line)
+        except Exception: continue
+        # Find earliest tool span timestamp AND check if this trace has a real query
+        earliest = None
+        has_real_query = False
+        for s in t.get("spans", []):
+            op = s.get("operationName", "")
+            if not op.startswith("tool."): continue
+            ts = s.get("startTime", 0)
+            if earliest is None or ts < earliest: earliest = ts
+            tags = {{tg["key"]: tg["value"] for tg in s.get("tags", [])}}
+            try: inp = json.loads(tags.get("tool.input","{{}}"))
+            except Exception: inp = {{}}
+            uq = (inp.get("user_query") or "").strip()
+            if uq and uq.lower() not in EXCLUDED:
+                has_real_query = True
+        if has_real_query and earliest is not None:
+            days.add(datetime.fromtimestamp(earliest/1e6, tz=TZ).date().isoformat())
+for d in sorted(days):
+    print(d)
+"""
+
 def fetch_window(host, remote_path, start_us, end_us):
-    """SSH to host, run a tiny date-filter on the remote archive, return JSONL lines."""
+    """SSH to host, run a date-filter on the remote archive, return JSONL lines."""
     script = REMOTE_FILTER.format(start_us=start_us, end_us=end_us, path=remote_path)
-    # SSH concatenates argv into a single command string for the remote shell, so the
-    # Python script must be pre-quoted before it goes over the wire.
     cmd = ["ssh", host, f"python3 -c {shlex.quote(script)}"]
-    print(f"[fetch] ssh {host} ...", file=sys.stderr)
+    print(f"[fetch] ssh {host} (window)...", file=sys.stderr)
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
         sys.exit(f"ssh fetch failed (exit {r.returncode})")
-    size = len(r.stdout)
-    print(f"[fetch] received {size:,} bytes", file=sys.stderr)
+    print(f"[fetch] received {len(r.stdout):,} bytes", file=sys.stderr)
     return r.stdout
+
+
+def fetch_active_dates(host, remote_path):
+    """Cheap pre-pass: return sorted list of dates that had any real (non-probe) query."""
+    script = REMOTE_ACTIVE_DATES.format(path=remote_path)
+    cmd = ["ssh", host, f"python3 -c {shlex.quote(script)}"]
+    print(f"[fetch] ssh {host} (active dates)...", file=sys.stderr)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(f"ssh active-dates failed (exit {r.returncode})")
+    dates = [date.fromisoformat(s.strip()) for s in r.stdout.splitlines() if s.strip()]
+    print(f"[fetch] {len(dates)} active dates", file=sys.stderr)
+    return dates
+
+
+def detect_continuous_start(active_dates, min_gap_days=7):
+    """Returns (start_date, gap_size_days). gap_size=0 when data is contiguous."""
+    if not active_dates:
+        return None, 0
+    active = sorted(active_dates)
+    largest_gap = 0
+    after_largest = active[0]
+    for i in range(1, len(active)):
+        gap = (active[i] - active[i-1]).days - 1
+        if gap > largest_gap:
+            largest_gap = gap
+            after_largest = active[i]
+    if largest_gap >= min_gap_days:
+        return after_largest, largest_gap
+    return active[0], 0
 
 
 # ----------------------------------------------------------------------------
@@ -493,14 +554,11 @@ def render_html(sessions, agg, start_date, end_date, top_n):
     generated = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
     period_str = f"{window_start.strftime('%d %B %Y')} to {window_end.strftime('%d %B %Y')}"
 
-    # Continuous-data caveat
+    # Continuous-data caveat — one short line
     caveat = ""
-    if agg["first_active"]:
-        first_active = date.fromisoformat(agg["first_active"]).strftime("%d %B %Y")
-        caveat = f"Data observed from {first_active}."
-        if agg.get("continuous_since"):
-            cs = date.fromisoformat(agg["continuous_since"]).strftime("%d %B %Y")
-            caveat += f" Continuous capture since {cs} (earlier window had a {agg['largest_gap_days']}-day gap)."
+    cs = agg.get("continuous_since")
+    if cs:
+        caveat = f"Data available since {date.fromisoformat(cs).strftime('%d %B %Y')}."
 
     peak_str = ""
     if agg["peak_day"][0]:
@@ -657,23 +715,32 @@ def render_html(sessions, agg, start_date, end_date, top_n):
 
 def main():
     args = parse_args()
+    user_specified = bool(args.since or args.start or args.end)
     start_date, end_date = resolve_window(args)
+    today = datetime.now(TZ_IST).date()
 
-    if start_date:
-        start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
-    else:
-        start_us = 0
-    end_us = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
+    # Always determine the date when continuous capture started (used for caveat,
+    # and as the default window start when the user gave no range).
+    active_dates = fetch_active_dates(args.host, args.remote)
+    continuous_start, gap_days = detect_continuous_start(active_dates)
+
+    if not user_specified:
+        start_date = continuous_start
+        end_date   = today
+        print(f"[window] defaulting to continuous capture: {start_date} to {end_date}", file=sys.stderr)
+
+    start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000) if start_date else 0
+    end_us   = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
 
     jsonl_text = fetch_window(args.host, args.remote, start_us, end_us)
     sessions = load_sessions(jsonl_text)
     print(f"[parse] {len(sessions):,} real user queries in window", file=sys.stderr)
 
-    # If start_date wasn't given, anchor to earliest session
     if start_date is None:
         start_date = sessions[0]["start_dt"].astimezone(TZ_IST).date() if sessions else end_date
 
     agg = aggregate(sessions, start_date, end_date)
+    agg["continuous_since"] = continuous_start.isoformat() if continuous_start else None
     html_doc = render_html(sessions, agg, start_date, end_date, args.top)
 
     out_path = Path(args.output).expanduser() if args.output else default_output_path()
