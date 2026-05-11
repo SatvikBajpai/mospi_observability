@@ -244,25 +244,20 @@ def aggregate(sessions, start_date, end_date):
     by_hour_ist = Counter()
     by_dow_ist  = Counter()
     datasets    = Counter()
-    filters     = Counter()
-    filter_values = defaultdict(Counter)
     themes      = Counter()
     scripts     = Counter()
     repeated    = Counter()
     samples_per_theme = defaultdict(list)
+    total_tool_calls = 0
 
     for s in sessions:
         d_ist = s["start_dt"].astimezone(TZ_IST)
         by_day[d_ist.strftime("%Y-%m-%d")] += 1
         by_hour_ist[d_ist.hour] += 1
         by_dow_ist[d_ist.strftime("%a")] += 1
+        total_tool_calls += s["n_steps"]
 
         if s["dataset"]: datasets[s["dataset"]] += 1
-        for fk, fv in s["filters"].items():
-            if fk in ("limit", "Format", "page"): continue
-            filters[fk] += 1
-            if isinstance(fv, (str, int, float, bool)):
-                filter_values[fk][str(fv)] += 1
 
         scripts[detect_script(s["user_query"])] += 1
         for th in classify_themes(s["user_query"]):
@@ -272,32 +267,44 @@ def aggregate(sessions, start_date, end_date):
                 samples_per_theme[th].append(nice)
         repeated[s["user_query"].strip().lower()] += 1
 
-    # Best-day metric
-    best = max(by_day.items(), key=lambda kv: kv[1]) if by_day else (None, 0)
+    # Peak day (objective: highest count) — neutral framing, no judgement
+    peak = max(by_day.items(), key=lambda kv: kv[1]) if by_day else (None, 0)
 
-    # Stats
-    counts = sorted(by_day.values(), reverse=True) or [0]
-    import statistics
+    # Detect the largest no-activity gap; if material, treat the day after as
+    # the start of "continuous" capture
+    sorted_active = sorted(by_day.keys())
+    continuous_since = None
+    largest_gap_days = 0
+    if len(sorted_active) >= 2:
+        biggest_gap_end = sorted_active[0]
+        for i in range(1, len(sorted_active)):
+            prev = date.fromisoformat(sorted_active[i-1])
+            cur  = date.fromisoformat(sorted_active[i])
+            gap_days = (cur - prev).days - 1
+            if gap_days > largest_gap_days:
+                largest_gap_days = gap_days
+                biggest_gap_end = sorted_active[i]
+        if largest_gap_days >= 7:
+            continuous_since = biggest_gap_end
+
     return {
-        "n":               len(sessions),
-        "n_unique":        len({s["user_query"].strip().lower() for s in sessions}),
-        "n_datasets":      len(datasets),
-        "n_active":        len(by_day),
-        "n_days":          (end_date - start_date).days + 1 if start_date else len(by_day),
-        "best_day":        best,
-        "avg_active":      statistics.mean(counts) if by_day else 0,
-        "median_active":   statistics.median(counts) if by_day else 0,
-        "good_day_avg":    statistics.mean(counts[:max(len(counts)//2, 1)]) if by_day else 0,
-        "by_day":          by_day,
-        "by_hour_ist":     [by_hour_ist.get(h, 0) for h in range(24)],
-        "by_dow_ist":      by_dow_ist,
-        "datasets":        datasets,
-        "filters":         filters,
-        "filter_values":   filter_values,
-        "themes":          themes,
-        "scripts":         scripts,
-        "samples_per_theme": dict(samples_per_theme),
-        "repeated":        repeated,
+        "n_queries":          len(sessions),
+        "n_tool_calls":       total_tool_calls,
+        "n_datasets":         len(datasets),
+        "n_days_in_window":   (end_date - start_date).days + 1 if start_date else len(by_day),
+        "first_active":       sorted_active[0] if sorted_active else None,
+        "last_active":        sorted_active[-1] if sorted_active else None,
+        "continuous_since":   continuous_since,
+        "largest_gap_days":   largest_gap_days,
+        "peak_day":           peak,
+        "by_day":             by_day,
+        "by_hour_ist":        [by_hour_ist.get(h, 0) for h in range(24)],
+        "by_dow_ist":         by_dow_ist,
+        "datasets":           datasets,
+        "themes":             themes,
+        "scripts":            scripts,
+        "samples_per_theme":  dict(samples_per_theme),
+        "repeated":           repeated,
     }
 
 
@@ -405,7 +412,6 @@ def render_html(sessions, agg, start_date, end_date, top_n):
     daily_chart   = column_chart(daily_vals, daily_labs, show_x_every=max(1, len(daily_labs)//12))
     theme_chart   = bar_chart_h(agg["themes"].most_common(top_n))
     dataset_chart = bar_chart_h(agg["datasets"].most_common(top_n), label_w=110)
-    filter_chart  = bar_chart_h(agg["filters"].most_common(top_n), label_w=200)
 
     # Common questions table
     common_top = [(q, n) for q, n in agg["repeated"].most_common(20) if n > 1][:top_n]
@@ -456,17 +462,6 @@ def render_html(sessions, agg, start_date, end_date, top_n):
             f'<tbody>{rows}</tbody></table>'
         )
 
-    # Top filter value drilldown (state_code etc.) — show top 3 dims with top values
-    fv_blocks = []
-    top_dims = [k for k, _ in agg["filters"].most_common(top_n)
-                if k not in ("indicator_code",) and k in agg["filter_values"]]
-    for dim in top_dims[:4]:
-        vals = agg["filter_values"][dim].most_common(8)
-        if not vals: continue
-        rows = "".join(f'<tr><td class="num">{n}</td><td>{esc(v)}</td></tr>' for v, n in vals)
-        fv_blocks.append(f'<div><h4>{esc(dim)}</h4><table class="data"><tbody>{rows}</tbody></table></div>')
-    fv_html = f'<div class="fv-grid">{"".join(fv_blocks)}</div>' if fv_blocks else ""
-
     # Selected real queries (not synthetic)
     SPECIAL_PATTERNS = [
         "trend in female labour force participation",
@@ -497,6 +492,21 @@ def render_html(sessions, agg, start_date, end_date, top_n):
 
     generated = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
     period_str = f"{window_start.strftime('%d %B %Y')} to {window_end.strftime('%d %B %Y')}"
+
+    # Continuous-data caveat
+    caveat = ""
+    if agg["first_active"]:
+        first_active = date.fromisoformat(agg["first_active"]).strftime("%d %B %Y")
+        caveat = f"Data observed from {first_active}."
+        if agg.get("continuous_since"):
+            cs = date.fromisoformat(agg["continuous_since"]).strftime("%d %B %Y")
+            caveat += f" Continuous capture since {cs} (earlier window had a {agg['largest_gap_days']}-day gap)."
+
+    peak_str = ""
+    if agg["peak_day"][0]:
+        peak_date = date.fromisoformat(agg["peak_day"][0]).strftime("%d %b")
+        peak_str = f'<span style="color:var(--muted);font-size:14px;font-weight:400">  on {peak_date}</span>'
+    peak_value = f'{fmt_int(agg["peak_day"][1])}{peak_str}'
 
     return f'''<!doctype html>
 <html lang="en">
@@ -534,8 +544,9 @@ def render_html(sessions, agg, start_date, end_date, top_n):
   .hero-label {{ font-size: 14px; color: var(--subtle); margin-top: 10px; }}
 
   /* KPI strip */
-  .kpis {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin: 0 0 22px;
+  .kpis {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin: 0 0 22px;
            border-bottom: 1px solid var(--line); }}
+  .caveat {{ font-size: 12px; color: var(--subtle); margin-top: 6px; font-style: italic; }}
   .kpi {{ padding: 18px 14px 20px 0; border-right: 1px solid var(--line); }}
   .kpi:last-child {{ border-right: 0; padding-left: 14px; }}
   .kpi-value {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 26px; line-height: 1.1; }}
@@ -587,39 +598,34 @@ def render_html(sessions, agg, start_date, end_date, top_n):
   <header>
     <h1>Claude Queries on MoSPI MCP</h1>
     <p class="meta">{esc(period_str)}  ·  Generated {esc(generated)}</p>
+    {f'<p class="caveat">{esc(caveat)}</p>' if caveat else ''}
   </header>
 
   <div class="hero">
-    <div class="hero-value">{fmt_int(agg['n'])}</div>
-    <div class="hero-label">user queries answered in this window</div>
+    <div class="hero-value">{fmt_int(agg['n_queries'])}</div>
+    <div class="hero-label">user queries</div>
   </div>
 
   <div class="kpis">
-    {kpi("Distinct questions", fmt_int(agg["n_unique"]))}
-    {kpi("Datasets reached", fmt_int(agg["n_datasets"]))}
-    {kpi("Active days", f'{agg["n_active"]} <span style="color:var(--muted);font-size:18px">/ {agg["n_days"]}</span>')}
-    {kpi("Good-day average", f"{agg['good_day_avg']:.1f}", "top half of active days")}
-    {kpi("Best day", fmt_int(agg["best_day"][1]), esc(agg["best_day"][0]) if agg["best_day"][0] else "")}
+    {kpi("Tool calls", fmt_int(agg["n_tool_calls"]))}
+    {kpi("Datasets queried", fmt_int(agg["n_datasets"]))}
+    {kpi("Peak day", peak_value)}
+    {kpi("Period", f"{agg['n_days_in_window']} days")}
   </div>
 
   <h2>1 · Most-asked questions</h2>
   {common_html or '<p class="meta">No question was asked more than once in this window.</p>'}
 
-  <h3>Themes detected across queries</h3>
+  <h2>2 · Themes</h2>
   {theme_chart}
 
-  <h2>2 · Datasets reached</h2>
+  <h2>3 · Datasets</h2>
   {dataset_chart}
 
-  <h2>3 · Filters applied</h2>
-  {filter_chart}
-
-  {('<h3>Top filter values</h3>' + fv_html) if fv_html else ''}
-
-  <h2>4 · Sample queries by theme</h2>
+  <h2>4 · Queries by theme</h2>
   {theme_blocks_html}
 
-  <h2>5 · When users showed up</h2>
+  <h2>5 · When</h2>
 
   <h3>By hour of day (IST)</h3>
   {hour_chart}
