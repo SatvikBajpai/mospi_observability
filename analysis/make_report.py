@@ -523,32 +523,44 @@ def render_html(sessions, agg, start_date, end_date, top_n):
             f'<tbody>{rows}</tbody></table>'
         )
 
-    # Selected real queries (not synthetic)
-    SPECIAL_PATTERNS = [
-        "trend in female labour force participation",
-        "external debt in us dollars",
-        "andaman nicobar enrolments",
-        "female police officers",
-        "main reasons for migration due to employment",
-        "panchayati raj",
-        "hydrogen cluster",
-        "demographic dividend is weakening",
-        "splitting rural and urban pfce",
-        "citi-style rural vs urban consumption tracker",
-        "gcc banking, oman exchange rate",
-        "শিশু",
-    ]
-    special, seen = [], set()
-    for pat in SPECIAL_PATTERNS:
-        for s in sessions:
-            if pat in s["user_query"].lower() and s["user_query_norm"] not in seen:
-                special.append(s); seen.add(s["user_query_norm"])
-                break
-    special_html = "".join(
+    # Notable queries — selected dynamically from the current window by an
+    # objective score (length, research-style phrasing, multi-dataset mentions).
+    # Common repeated questions are excluded because they already appear above.
+    common_lookup = {q for q, n in agg["repeated"].items() if n >= 3}
+    RESEARCH_VERBS = (
+        "assess", "compare", "track", "quantify", "estimate", "map ",
+        "cross-reference", "benchmark", "analyze", "examine", "identify",
+        "need to verify", "find ", "trend in", "what is",
+    )
+    DS_NAMES = ("plfs", "cpi", "iip", "asi", "nas", "wpi", "energy", "aishe",
+                "asuse", "gender", "nfhs", "envstats", "rbi", "nss", "cpialrl",
+                "hces", "tus", "udise", "mnre")
+
+    def score(s):
+        q = s["user_query"].strip()
+        ql = q.lower()
+        sc = len(q)
+        if any(ql.startswith(v) for v in RESEARCH_VERBS):
+            sc += 30
+        sc += 5 * sum(1 for w in DS_NAMES if w in ql)
+        return sc
+
+    candidates = sorted(
+        (s for s in sessions if s["user_query"].strip().lower() not in common_lookup),
+        key=score, reverse=True,
+    )
+    notable, seen = [], set()
+    for s in candidates:
+        if s["user_query_norm"] in seen: continue
+        seen.add(s["user_query_norm"])
+        notable.append(s)
+        if len(notable) >= 12: break
+
+    notable_html = "".join(
         f'<div class="hl-row"><div class="hl-q">{esc(s["user_query_norm"])}</div>'
         f'<div class="hl-meta">{esc(s["dataset"] or "-")} · {s["start_dt"].astimezone(TZ_IST).strftime("%d %b").upper()}</div>'
         f'</div>'
-        for s in special
+        for s in notable
     )
 
     generated = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
@@ -699,7 +711,7 @@ def render_html(sessions, agg, start_date, end_date, top_n):
 
   {(f'<h2>7 · Multilingual queries</h2>' + biling_html) if biling_html else ''}
 
-  {(f'<h2>{8 if biling_html else 7} · Selected sophisticated queries</h2><div class="highlights">' + special_html + '</div>') if special_html else ''}
+  {(f'<h2>{8 if biling_html else 7} · Detailed queries</h2><div class="highlights">' + notable_html + '</div>') if notable_html else ''}
 
   <div class="footer">
     {esc(period_str)} · Generated {esc(generated)}
