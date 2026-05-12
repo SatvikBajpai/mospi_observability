@@ -328,7 +328,7 @@ def aggregate(sessions, start_date, end_date):
                 samples_per_theme[th].append(nice)
         repeated[s["user_query"].strip().lower()] += 1
 
-    # Peak day (objective: highest count) — neutral framing, no judgement
+    # Peak day (objective: highest count) - neutral framing, no judgement
     peak = max(by_day.items(), key=lambda kv: kv[1]) if by_day else (None, 0)
 
     # Detect the largest no-activity gap; if material, treat the day after as
@@ -523,7 +523,7 @@ def render_html(sessions, agg, start_date, end_date, top_n):
             f'<tbody>{rows}</tbody></table>'
         )
 
-    # Notable queries — selected dynamically from the current window by an
+    # Notable queries - selected dynamically from the current window by an
     # objective score (length, research-style phrasing, multi-dataset mentions).
     # Common repeated questions are excluded because they already appear above.
     common_lookup = {q for q, n in agg["repeated"].items() if n >= 3}
@@ -566,7 +566,7 @@ def render_html(sessions, agg, start_date, end_date, top_n):
     generated = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
     period_str = f"{window_start.strftime('%d %B %Y')} to {window_end.strftime('%d %B %Y')}"
 
-    # Continuous-data caveat — one short line; if the window was clipped, add a note
+    # Continuous-data caveat - one short line; if the window was clipped, add a note
     caveat = ""
     cs = agg.get("continuous_since")
     if cs:
@@ -796,7 +796,7 @@ def main():
             print(f"[window] requested {requested_start}..{end_date} is entirely before {continuous_start}",
                   file=sys.stderr)
         elif requested_start < continuous_start:
-            # Partial overlap — clip start to continuous_start
+            # Partial overlap - clip start to continuous_start
             start_date = continuous_start
             clipped = True
             print(f"[window] clipped: requested {requested_start} -> {continuous_start} (continuous start)",

@@ -1,19 +1,25 @@
-# Ignore Python cache
+# Python cache
 __pycache__/
 *.py[cod]
 
-# Ignore log files
+# Logs
 *.log
 
-# Optional: ignore virtual environments
+# Virtual environments / secrets
 venv/
 .env
 
-# macOS files
+# macOS
 .DS_Store
 
-# Trace data — never commit (large, may contain user query text / IPs)
+# Trace data: never commit (large; may contain user query text / IPs)
 all_traces.json
 traces.jsonl
 *.jsonl
 archive/
+
+# Generated reports and local screenshots
+analysis/report.html
+analysis/*.png
+~/Desktop/mospi-report-*.html
+mospi-report-*.html
