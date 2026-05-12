@@ -566,11 +566,15 @@ def render_html(sessions, agg, start_date, end_date, top_n):
     generated = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
     period_str = f"{window_start.strftime('%d %B %Y')} to {window_end.strftime('%d %B %Y')}"
 
-    # Continuous-data caveat — one short line
+    # Continuous-data caveat — one short line; if the window was clipped, add a note
     caveat = ""
     cs = agg.get("continuous_since")
     if cs:
-        caveat = f"Data available since {date.fromisoformat(cs).strftime('%d %B %Y')}."
+        cs_str = date.fromisoformat(cs).strftime('%d %B %Y')
+        caveat = f"Data available since {cs_str}."
+        if agg.get("clipped") and agg.get("requested_start"):
+            rs = date.fromisoformat(agg["requested_start"]).strftime('%d %B %Y')
+            caveat += f" Showing from this date onwards (your range began earlier, on {rs})."
 
     peak_str = ""
     if agg["peak_day"][0]:
@@ -725,21 +729,92 @@ def render_html(sessions, agg, start_date, end_date, top_n):
 # Main
 # ----------------------------------------------------------------------------
 
+def render_empty_html(requested_start, requested_end, continuous_start):
+    """Render a clear empty-state page when the requested window has no data."""
+    cs_str = continuous_start.strftime("%d %B %Y") if continuous_start else "06 May 2026"
+    req = f"{requested_start.strftime('%d %B %Y')} to {requested_end.strftime('%d %B %Y')}" \
+          if requested_start else f"up to {requested_end.strftime('%d %B %Y')}"
+    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Queries on MoSPI MCP - No data</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;500;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  html, body {{ background: #fbfaf7; color: {INK}; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; line-height: 1.55; }}
+  .page {{ max-width: 720px; margin: 0 auto; padding: 96px 64px 80px; background: #fff; box-shadow: 0 1px 0 {LINE}; }}
+  h1 {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 36px; line-height: 1.1; margin: 0 0 12px; color: {INK}; }}
+  .meta {{ font-size: 12px; color: {SUBTLE}; letter-spacing: 0.06em; text-transform: uppercase; }}
+  .caveat {{ font-size: 13px; color: {SUBTLE}; font-style: italic; margin-top: 6px; }}
+  .empty {{ margin-top: 48px; padding: 36px 0; border-top: 1px solid {LINE}; border-bottom: 1px solid {LINE}; }}
+  .empty-h {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 48px; color: {INK}; line-height: 1; letter-spacing: -0.02em; }}
+  .empty-sub {{ font-size: 14px; color: {SUBTLE}; margin-top: 14px; }}
+  .hint {{ margin-top: 28px; font-family: 'EB Garamond', Georgia, serif; font-size: 17px; color: {INK}; }}
+</style></head><body><div class="page">
+  <h1>Claude Queries on MoSPI MCP</h1>
+  <p class="meta">Requested window: {esc(req)}</p>
+  <p class="caveat">Data available since {esc(cs_str)}.</p>
+  <div class="empty">
+    <div class="empty-h">No data</div>
+    <div class="empty-sub">No queries recorded in this window.</div>
+  </div>
+  <p class="hint">Please try a range from <strong>{esc(cs_str)}</strong> onwards.</p>
+</div></body></html>'''
+
+
 def main():
     args = parse_args()
     user_specified = bool(args.since or args.start or args.end)
-    start_date, end_date = resolve_window(args)
+    requested_start, end_date = resolve_window(args)
     today = datetime.now(TZ_IST).date()
 
-    # Always determine the date when continuous capture started (used for caveat,
-    # and as the default window start when the user gave no range).
+    # Always determine the date when continuous capture started.
     active_dates = fetch_active_dates(args.host, args.remote)
     continuous_start, gap_days = detect_continuous_start(active_dates)
 
+    # Resolve the effective window and figure out which case we're in.
+    clipped = False
+    empty_pre_data = False
+
     if not user_specified:
+        # Default: continuous_start → today
         start_date = continuous_start
         end_date   = today
-        print(f"[window] defaulting to continuous capture: {start_date} to {end_date}", file=sys.stderr)
+        print(f"[window] default: {start_date} to {end_date}", file=sys.stderr)
+    else:
+        # Treat --end alone as "from continuous_start to --end"
+        if requested_start is None:
+            requested_start = continuous_start or end_date
+
+        if continuous_start is None:
+            empty_pre_data = True
+            start_date = requested_start
+        elif end_date < continuous_start:
+            # Entire requested window is before any data
+            empty_pre_data = True
+            start_date = requested_start
+            print(f"[window] requested {requested_start}..{end_date} is entirely before {continuous_start}",
+                  file=sys.stderr)
+        elif requested_start < continuous_start:
+            # Partial overlap — clip start to continuous_start
+            start_date = continuous_start
+            clipped = True
+            print(f"[window] clipped: requested {requested_start} -> {continuous_start} (continuous start)",
+                  file=sys.stderr)
+        else:
+            start_date = requested_start
+
+    # Render path: empty state vs normal report
+    out_path = Path(args.output).expanduser() if args.output else default_output_path()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if empty_pre_data:
+        html_doc = render_empty_html(requested_start, end_date, continuous_start)
+        out_path.write_text(html_doc)
+        print(f"[write] {out_path}  ({out_path.stat().st_size:,} bytes) [empty-state]", file=sys.stderr)
+        if not args.no_open and sys.platform == "darwin":
+            subprocess.run(["open", str(out_path)])
+        return
 
     start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000) if start_date else 0
     end_us   = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
@@ -753,13 +828,12 @@ def main():
 
     agg = aggregate(sessions, start_date, end_date)
     agg["continuous_since"] = continuous_start.isoformat() if continuous_start else None
+    agg["clipped"]          = clipped
+    agg["requested_start"]  = requested_start.isoformat() if (clipped and requested_start) else None
     html_doc = render_html(sessions, agg, start_date, end_date, args.top)
 
-    out_path = Path(args.output).expanduser() if args.output else default_output_path()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_doc)
     print(f"[write] {out_path}  ({out_path.stat().st_size:,} bytes)", file=sys.stderr)
-
     if not args.no_open and sys.platform == "darwin":
         subprocess.run(["open", str(out_path)])
         print(f"[open] opened in default browser", file=sys.stderr)
