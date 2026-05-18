@@ -56,6 +56,12 @@ def parse_args():
                    help="SSH alias to the Jaeger server (default: jaeger).")
     p.add_argument("--remote", default="~/observability/archive/traces.jsonl",
                    help="Path to traces.jsonl on the server.")
+    p.add_argument("--syslog-remote", default="~/syslog.jsonl",
+                   help="Path to syslog.jsonl on the server (CPU/RAM samples).")
+    p.add_argument("--syslog-local", default=None,
+                   help="If set, read syslog.jsonl from this local path instead of SSH-fetching.")
+    p.add_argument("--no-syslog", action="store_true",
+                   help="Skip the CPU/RAM section even if syslog is reachable.")
     p.add_argument("--start",  help="Start date YYYY-MM-DD (IST, inclusive).")
     p.add_argument("--end",    help="End date YYYY-MM-DD (IST, inclusive).")
     p.add_argument("--since",  type=int, metavar="N",
@@ -161,6 +167,113 @@ def fetch_active_dates(host, remote_path):
     dates = [date.fromisoformat(s.strip()) for s in r.stdout.splitlines() if s.strip()]
     print(f"[fetch] {len(dates)} active dates", file=sys.stderr)
     return dates
+
+
+REMOTE_SYSLOG_FILTER = r"""
+import os, re
+LEADING = re.compile(r'(:\s*)\.(\d)')
+P = os.path.expanduser({path!r})
+START, END = {start_iso!r}, {end_iso!r}
+try:
+    with open(P) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            i = line.find('"timestamp":"')
+            if i < 0: continue
+            ts = line[i+13:i+33]
+            if START <= ts <= END:
+                print(LEADING.sub(r'\g<1>0.\2', line))
+except FileNotFoundError:
+    pass
+"""
+
+def parse_gi(s):
+    """'15Gi' -> 15.0, '1850Mi' -> 1.807, '512Ki' -> 0.0005, None -> None."""
+    if s is None: return None
+    m = re.match(r'^\s*([\d.]+)\s*([KMG])i?\s*$', str(s))
+    if not m: return None
+    v, unit = float(m.group(1)), m.group(2)
+    return {'K': v/1024/1024, 'M': v/1024, 'G': v}[unit]
+
+
+LEADING_ZERO_FIX = re.compile(r'(:\s*)\.(\d)')
+
+def _parse_syslog_text(text, start_date, end_date):
+    """Tolerantly parse syslog JSONL text; filter by date window (IST)."""
+    start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
+    end_us   = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
+    samples = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line: continue
+        fixed = LEADING_ZERO_FIX.sub(r'\g<1>0.\2', line)
+        try:
+            rec = json.loads(fixed)
+            dt = datetime.fromisoformat(rec["timestamp"].replace("Z","+00:00"))
+            ts_us = int(dt.timestamp() * 1_000_000)
+            if not (start_us <= ts_us < end_us): continue
+            samples.append({
+                "ts":           dt,
+                "cpu":          float(rec["cpu_used_pct"]),
+                "ram_used_gi":  parse_gi(rec.get("ram_used")),
+                "ram_free_gi":  parse_gi(rec.get("ram_free")),
+                "ram_total_gi": parse_gi(rec.get("ram_total")),
+            })
+        except Exception:
+            continue
+    samples.sort(key=lambda s: s["ts"])
+    return samples
+
+
+def fetch_syslog(host, remote_path, start_date, end_date, local_path=None):
+    """Return syslog samples in window. Reads from local_path if given;
+    otherwise SSH-streams from the server. Returns [] on any failure."""
+    if local_path:
+        try:
+            text = Path(local_path).expanduser().read_text()
+        except FileNotFoundError:
+            print(f"[syslog] local file not found: {local_path}; skipping", file=sys.stderr)
+            return []
+        samples = _parse_syslog_text(text, start_date, end_date)
+        print(f"[syslog] {len(samples)} samples parsed from {local_path}", file=sys.stderr)
+        return samples
+
+    start_iso = f"{start_date.isoformat()}T00:00:00Z"
+    end_iso   = f"{(end_date + timedelta(days=1)).isoformat()}T00:00:00Z"
+    script = REMOTE_SYSLOG_FILTER.format(path=remote_path, start_iso=start_iso, end_iso=end_iso)
+    cmd = ["ssh", host, f"python3 -c {shlex.quote(script)}"]
+    print(f"[syslog] ssh {host} (window)...", file=sys.stderr)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        print(f"[syslog] SSH failed ({e}); skipping CPU section", file=sys.stderr)
+        return []
+    if r.returncode != 0:
+        print(f"[syslog] SSH exit {r.returncode}; skipping CPU section", file=sys.stderr)
+        return []
+    samples = _parse_syslog_text(r.stdout, start_date, end_date)
+    print(f"[syslog] {len(samples)} samples parsed in window", file=sys.stderr)
+    return samples
+
+
+def aggregate_cpu(samples):
+    if not samples: return {}
+    cpus = sorted(s["cpu"] for s in samples)
+    n = len(cpus)
+    peak_sample = max(samples, key=lambda s: s["cpu"])
+    spikes = sorted([s for s in samples if s["cpu"] >= 50],
+                    key=lambda s: -s["cpu"])[:5]
+    return {
+        "n":          n,
+        "min":        cpus[0],
+        "max":        cpus[-1],
+        "mean":       sum(cpus) / n,
+        "median":     cpus[n//2],
+        "p95":        cpus[int(0.95 * (n-1))],
+        "peak_time":  peak_sample["ts"],
+        "spikes":     spikes,
+    }
 
 
 def detect_continuous_start(active_dates, min_gap_days=7):
@@ -398,6 +511,63 @@ def bar_chart_h(items, width=760, bar_h=22, gap=8, label_w=240, value_w=64):
     return f'<svg viewBox="0 0 {width} {chart_h}" xmlns="http://www.w3.org/2000/svg" class="chart">{"".join(parts)}</svg>'
 
 
+def polyline_chart(points, width=760, height=240, y_max=None):
+    """points = [(datetime, value), ...]. Renders SVG line over time."""
+    if not points: return '<div class="chart-empty">No data.</div>'
+
+    pad_l, pad_r, pad_t, pad_b = 44, 16, 14, 38
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    times  = [p[0] for p in points]
+    values = [p[1] for p in points]
+    t_min, t_max = min(times), max(times)
+    t_range = max((t_max - t_min).total_seconds(), 1.0)
+
+    if y_max is None:
+        raw = max(values) if values else 1
+        # nice round-up to one of {1,2,5,10,...} * 10^k
+        def nice(v):
+            if v <= 0: return 1
+            exp = 10 ** math.floor(math.log10(v))
+            for k in (1, 2, 5, 10):
+                if k * exp >= v: return k * exp
+            return v
+        y_max = max(nice(raw), 1)
+
+    def xpos(t):
+        return pad_l + (t - t_min).total_seconds() / t_range * plot_w
+    def ypos(v):
+        return pad_t + plot_h - (v / y_max if y_max else 0) * plot_h
+
+    pts = " ".join(f"{xpos(t):.1f},{ypos(v):.1f}" for t, v in points)
+
+    # Area fill under line (polygon: line points + bottom-right + bottom-left)
+    area_pts = f"{pad_l:.1f},{pad_t+plot_h:.1f} {pts} {pad_l + plot_w:.1f},{pad_t+plot_h:.1f}"
+
+    grid = []
+    for ratio in (0, 0.5, 1.0):
+        v = y_max * ratio
+        y = pad_t + plot_h - ratio * plot_h
+        grid.append(f'<line x1="{pad_l}" x2="{width-pad_r}" y1="{y:.1f}" y2="{y:.1f}" stroke="{LINE}" stroke-width="1"/>')
+        grid.append(f'<text x="{pad_l-6}" y="{y+3:.1f}" text-anchor="end" '
+                    f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{v:.0f}%</text>')
+
+    xlabs = [
+        f'<text x="{pad_l:.0f}" y="{height-pad_b+16}" text-anchor="start" '
+        f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{esc(t_min.astimezone(TZ_IST).strftime("%d %b %H:%M"))}</text>',
+        f'<text x="{(width-pad_r):.0f}" y="{height-pad_b+16}" text-anchor="end" '
+        f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{esc(t_max.astimezone(TZ_IST).strftime("%d %b %H:%M"))}</text>',
+    ]
+
+    return (f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" class="chart">'
+            + "".join(grid)
+            + f'<polygon points="{area_pts}" fill="{ACCENT_SOFT}" opacity="0.5"/>'
+            + f'<polyline points="{pts}" stroke="{ACCENT}" stroke-width="1.5" fill="none"/>'
+            + "".join(xlabs)
+            + '</svg>')
+
+
 def column_chart(values, labels, width=760, height=260, show_x_every=1):
     if not values:
         return '<div class="chart-empty">No data.</div>'
@@ -450,7 +620,7 @@ def kpi(label, value, sub=""):
       {f'<div class="kpi-sub">{sub}</div>' if sub else ''}</div>'''
 
 
-def render_html(sessions, agg, start_date, end_date, top_n):
+def render_html(sessions, agg, start_date, end_date, top_n, syslog_samples=None):
     if not sessions:
         period = f"{start_date or 'all time'} to {end_date}"
         return f"<!doctype html><html><body><p>No real user queries in {esc(period)}.</p></body></html>"
@@ -565,6 +735,75 @@ def render_html(sessions, agg, start_date, end_date, top_n):
 
     generated = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
     period_str = f"{window_start.strftime('%d %B %Y')} to {window_end.strftime('%d %B %Y')}"
+
+    # ---- MCP server CPU section (optional, only if syslog samples present) ----
+    cpu_section_html = ""
+    if syslog_samples:
+        c = aggregate_cpu(syslog_samples)
+        cpu_line_chart = polyline_chart(
+            [(s["ts"], s["cpu"]) for s in syslog_samples], y_max=100,
+        )
+        per_hr = defaultdict(list)
+        for s in syslog_samples:
+            per_hr[s["ts"].astimezone(TZ_IST).hour].append(s["cpu"])
+        hr_means = [(sum(per_hr[h])/len(per_hr[h]) if per_hr.get(h) else 0) for h in range(24)]
+        cpu_hour_chart = column_chart(hr_means, [f"{h:02d}" for h in range(24)], show_x_every=2)
+
+        peak_when = c["peak_time"].astimezone(TZ_IST).strftime("%d %b %H:%M")
+        spike_html = ""
+        if c["spikes"]:
+            rows = "".join(
+                f'<tr><td>{s["ts"].astimezone(TZ_IST).strftime("%d %b %H:%M:%S")}</td>'
+                f'<td class="num">{s["cpu"]:.1f}%</td>'
+                f'<td>{s["ram_used_gi"]:.2f} GiB</td></tr>'
+                for s in c["spikes"]
+            )
+            spike_html = (
+                '<h3>Top CPU spikes (>= 50%)</h3>'
+                '<table class="data"><thead>'
+                '<tr><th>When (IST)</th><th>CPU</th><th>RAM used</th></tr>'
+                f'</thead><tbody>{rows}</tbody></table>'
+            )
+
+        # RAM one-liner: lowest free RAM moment
+        free_vals = [s["ram_free_gi"] for s in syslog_samples if s["ram_free_gi"] is not None]
+        ram_note = ""
+        if free_vals:
+            tot = next((s["ram_total_gi"] for s in syslog_samples if s["ram_total_gi"]), None)
+            ram_note = (
+                f'<p class="meta" style="margin-top:14px">'
+                f'RAM: lowest free <strong>{min(free_vals):.2f} GiB</strong> of '
+                f'{tot:.1f} GiB; max used <strong>{max(s["ram_used_gi"] for s in syslog_samples if s["ram_used_gi"] is not None):.2f} GiB</strong>.'
+                f'</p>'
+            )
+
+        cpu_section_html = f'''
+  <h2>{{cpu_sn}} · MCP server CPU usage</h2>
+  <div class="kpis">
+    {kpi("Median CPU", f"{c['median']:.1f}%")}
+    {kpi("Mean CPU",   f"{c['mean']:.1f}%")}
+    {kpi("Peak",       f"{c['max']:.1f}%", esc(peak_when))}
+    {kpi("Samples",    fmt_int(c['n']))}
+  </div>
+
+  <h3>CPU% over time</h3>
+  {cpu_line_chart}
+
+  <h3>Mean CPU by hour of day (IST)</h3>
+  {cpu_hour_chart}
+
+  {spike_html}
+  {ram_note}
+'''
+
+    # Section numbering for the trailing optional sections
+    cpu_sn     = 6 if syslog_samples else None
+    recent_sn  = (cpu_sn + 1) if cpu_sn else 6
+    biling_sn  = (recent_sn + 1) if biling_html else None
+    notable_sn = (biling_sn or recent_sn) + 1 if notable_html else None
+
+    if cpu_section_html:
+        cpu_section_html = cpu_section_html.format(cpu_sn=cpu_sn)
 
     # Continuous-data caveat - one short line; if the window was clipped, add a note
     caveat = ""
@@ -710,12 +949,14 @@ def render_html(sessions, agg, start_date, end_date, top_n):
   <h3>Daily volume</h3>
   {daily_chart}
 
-  <h2>6 · Recent queries</h2>
+  {cpu_section_html}
+
+  <h2>{recent_sn} · Recent queries</h2>
   {recent_html}
 
-  {(f'<h2>7 · Multilingual queries</h2>' + biling_html) if biling_html else ''}
+  {(f'<h2>{biling_sn} · Multilingual queries</h2>' + biling_html) if biling_html else ''}
 
-  {(f'<h2>{8 if biling_html else 7} · Detailed queries</h2><div class="highlights">' + notable_html + '</div>') if notable_html else ''}
+  {(f'<h2>{notable_sn} · Detailed queries</h2><div class="highlights">' + notable_html + '</div>') if notable_html else ''}
 
   <div class="footer">
     {esc(period_str)} · Generated {esc(generated)}
@@ -830,7 +1071,13 @@ def main():
     agg["continuous_since"] = continuous_start.isoformat() if continuous_start else None
     agg["clipped"]          = clipped
     agg["requested_start"]  = requested_start.isoformat() if (clipped and requested_start) else None
-    html_doc = render_html(sessions, agg, start_date, end_date, args.top)
+
+    syslog_samples = []
+    if not args.no_syslog:
+        syslog_samples = fetch_syslog(args.host, args.syslog_remote, start_date, end_date,
+                                       local_path=args.syslog_local)
+
+    html_doc = render_html(sessions, agg, start_date, end_date, args.top, syslog_samples)
 
     out_path.write_text(html_doc)
     print(f"[write] {out_path}  ({out_path.stat().st_size:,} bytes)", file=sys.stderr)

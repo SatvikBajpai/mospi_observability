@@ -55,6 +55,9 @@ python3 analysis/make_report.py --no-open
 | `--output` | `~/Desktop/mospi-report-<stamp>.html` | Where to write the HTML |
 | `--no-open` | off | Skip auto-launching the browser |
 | `--top` | `12` | Cap for top-N lists in the report |
+| `--syslog-remote` | `~/syslog.jsonl` | Path to syslog.jsonl on the server (CPU/RAM samples) |
+| `--syslog-local` | unset | If set, reads syslog from a local file instead of SSH-fetching |
+| `--no-syslog` | off | Skip the CPU/RAM section entirely |
 
 ## Date-window behaviour
 
@@ -100,6 +103,23 @@ Every report shows a single italic line near the title: *Data available since DD
 
 The archiver is append-only and deduplicates by trace ID, so it is safe to run
 on any schedule. A fcntl lock prevents concurrent runs from corrupting the file.
+
+## MCP server CPU section
+
+If the server has a `~/syslog.jsonl` file (one JSON object per line, with
+fields `timestamp`, `cpu_used_pct`, `ram_total`, `ram_used`, `ram_free`,
+`disk_*`), the report includes an "MCP server CPU usage" section: median,
+mean, peak CPU, a CPU-over-time line chart, hour-of-day means, a top-spikes
+table, and a one-line RAM summary.
+
+The parser is tolerant: lines with malformed numbers like `:.8` (missing
+leading zero) are auto-fixed and lines whose timestamp is outside the
+window are dropped server-side before transfer.
+
+To skip this section entirely, pass `--no-syslog`. To point at a different
+file on the server, use `--syslog-remote /path/on/server/syslog.jsonl`. To
+generate the section from a local file (for testing or offline runs), use
+`--syslog-local ./syslog.jsonl`.
 
 ## Setup from scratch
 
