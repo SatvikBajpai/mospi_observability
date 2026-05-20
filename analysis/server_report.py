@@ -2,24 +2,30 @@
 Server-side comprehensive engagement report for the MoSPI MCP server.
 
 Runs ON the Jaeger host (no SSH needed). Reads:
-  - ~/observability/archive/traces.jsonl   (trace archive)
-  - ~/syslog.jsonl                          (CPU/RAM samples, optional)
+  - ~/observability/archive/traces.jsonl  (trace archive)
+  - ~/syslog.jsonl                         (CPU/RAM samples, optional)
 
-Produces a single HTML report covering:
-  - Tool calls across all clients (Claude, ChatGPT/OpenAI, scripts, etc.)
-    identified from the user_agent header.
-  - Distribution of tool calls (list_datasets / get_indicators /
-    get_metadata / get_data) overall and per client.
-  - Dataset usage, overall and per client.
-  - CPU utilisation from syslog (line chart, hour-of-day, peak spikes).
-  - Activity over time (hour, weekday, daily).
-  - Recent tool-call timeline.
+Produces one HTML report covering:
+  - Per-client x per-tool call matrix (the main view)
+  - CPU utilisation from syslog
+  - Tool call distribution
+  - Dataset usage (overall + per client, with mini bars)
+  - Top user queries (cross-client)
+  - Activity over time (hour, weekday, daily)
+  - Reliability and latency (errors, p50/p95/p99, total bytes served)
 
-CLI:
-    python3 server_report.py                                  # since continuous start
+Can also email the report to a recipient list via SMTP - suitable for a
+weekly cron job.
+
+Examples
+--------
+    python3 server_report.py
     python3 server_report.py --since 7
     python3 server_report.py --start 2026-05-10 --end 2026-05-19
-    python3 server_report.py --output /tmp/report.html --no-syslog
+    python3 server_report.py --since 7 \\
+        --email alice@example.com,bob@example.com \\
+        --smtp-host smtp.example.com --smtp-port 587 \\
+        --smtp-user noreply@example.com
 """
 import argparse
 import html
@@ -27,16 +33,28 @@ import json
 import math
 import os
 import re
+import smtplib
+import socket
 import statistics
 import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 from pathlib import Path
 
 TZ_IST = timezone(timedelta(hours=5, minutes=30))
 
-# Queries that are automated probes, not user engagement.
 EXCLUDED_QUERIES = {"health check", "healthcheck", "ping", "test"}
+
+# Datasets known to be legitimate MoSPI sources (kept in a fixed list so
+# we can distinguish them from accidental junk values like "M4BK").
+KNOWN_DATASETS = {
+    "PLFS","CPI","IIP","ASI","NAS","WPI","ENERGY","AISHE","ASUSE","GENDER",
+    "NFHS","ENVSTATS","RBI","NSS77","NSS78","NSS79","NSS80","CPIALRL",
+    "HCES","TUS","EC","UDISE","MNRE",
+}
 
 INK         = "#18181b"
 SUBTLE      = "#71717a"
@@ -44,6 +62,7 @@ MUTED       = "#a1a1aa"
 LINE        = "#e7e5e4"
 ACCENT      = "#1e3a8a"
 ACCENT_SOFT = "#dbeafe"
+WARN        = "#9f1239"
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -62,11 +81,22 @@ def parse_args():
     p.add_argument("--start",   help="Start date YYYY-MM-DD (IST, inclusive).")
     p.add_argument("--end",     help="End date YYYY-MM-DD (IST, inclusive).")
     p.add_argument("--since",   type=int, metavar="N",
-                   help="Last N days from today (IST), inclusive.")
+                   help="Last N days from today (IST), inclusive. Default 7.")
     p.add_argument("--output",  default=None,
                    help="HTML output path. Default: ./mospi-full-report-<stamp>.html")
     p.add_argument("--no-syslog", action="store_true", help="Skip the CPU section.")
     p.add_argument("--top",     type=int, default=12, help="Cap for top-N lists.")
+    # email
+    p.add_argument("--email",   default="",
+                   help="Comma-separated recipient list. If empty, no email is sent.")
+    p.add_argument("--smtp-host", default=os.environ.get("SMTP_HOST", "localhost"))
+    p.add_argument("--smtp-port", type=int, default=int(os.environ.get("SMTP_PORT", "25")))
+    p.add_argument("--smtp-user", default=os.environ.get("SMTP_USER", ""))
+    p.add_argument("--smtp-pass", default=os.environ.get("SMTP_PASS", ""))
+    p.add_argument("--from-addr", default=os.environ.get(
+                       "FROM_ADDR", f"mospi-mcp@{socket.gethostname()}"))
+    p.add_argument("--subject",  default=None,
+                   help="Email subject (default uses date range).")
     return p.parse_args()
 
 
@@ -74,16 +104,18 @@ def resolve_window(args):
     today = datetime.now(TZ_IST).date()
     if args.since:
         return today - timedelta(days=args.since - 1), today
-    start = date.fromisoformat(args.start) if args.start else None
-    end   = date.fromisoformat(args.end)   if args.end   else today
-    return start, end
+    if args.start:
+        start = date.fromisoformat(args.start)
+        end   = date.fromisoformat(args.end) if args.end else today
+        return start, end
+    # default: last 7 days
+    return today - timedelta(days=6), today
 
 
 # ---------------------------------------------------------------------------
-# Client classification (header-based)
+# Client classification
 # ---------------------------------------------------------------------------
 
-# Order matters: more specific first.
 CLIENT_RULES = [
     ("Claude Code CLI",   re.compile(r"claude-code", re.I)),
     ("Claude",            re.compile(r"claude", re.I)),
@@ -92,12 +124,12 @@ CLIENT_RULES = [
     ("Python script",     re.compile(r"python-(?:requests|httpx)|python/", re.I)),
     ("Node script",       re.compile(r"node-fetch|^node\b", re.I)),
     ("curl",              re.compile(r"^curl/", re.I)),
+    ("VS Code",           re.compile(r"Visual Studio Code", re.I)),
     ("Browser / generic", re.compile(r"mozilla", re.I)),
 ]
 
-def classify_client(ua: str) -> str:
-    if not ua or ua == "-":
-        return "Unknown (no UA)"
+def classify_client(ua):
+    if not ua or ua == "-": return "Unknown (no UA)"
     for label, pat in CLIENT_RULES:
         if pat.search(ua):
             return label
@@ -111,18 +143,10 @@ def classify_client(ua: str) -> str:
 STEP_NAMES = ["list_datasets", "get_indicators", "get_metadata", "get_data"]
 
 
-def parse_traces(path: Path, start_date, end_date):
-    """Stream traces.jsonl, return a list of tool-call dicts in window.
-
-    Each tool call is one tool.* span. We attribute it to its trace's
-    user_agent (taken from any http.user_agent / user_agent.original tag
-    seen in the trace's spans).
-    """
-    if start_date:
-        start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
-    else:
-        start_us = 0
-    end_us = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
+def parse_traces(path, start_date, end_date):
+    """Stream traces.jsonl and emit one dict per tool span in the window."""
+    start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
+    end_us   = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
 
     calls = []
     with path.open() as f:
@@ -132,62 +156,57 @@ def parse_traces(path: Path, start_date, end_date):
             try:    t = json.loads(line)
             except Exception: continue
 
-            # Trace-level: find a user_agent string anywhere in the trace.
-            ua = None
+            ua = ""
             for s in t.get("spans", []):
                 for tag in s.get("tags", []):
-                    k = tag["key"]
-                    if k in ("http.user_agent", "user_agent.original"):
-                        ua = ua or str(tag.get("value", "") or "")
-                        if ua: break
+                    if tag["key"] in ("http.user_agent", "user_agent.original"):
+                        v = str(tag.get("value", "") or "")
+                        if v:
+                            ua = v
+                            break
                 if ua: break
 
             for s in t.get("spans", []):
                 op = s.get("operationName", "")
-                if not op.startswith("tool."):
-                    continue
+                if not op.startswith("tool."): continue
                 ts = s["startTime"]
-                if not (start_us <= ts < end_us):
-                    continue
-                tags = {tg["key"]: tg["value"] for tg in s.get("tags", [])}
+                if not (start_us <= ts < end_us): continue
+                tags = {tg["key"]: tg.get("value") for tg in s.get("tags", [])}
                 tool_name = tags.get("tool.name") or op.replace("tool.", "")
                 try:    inp = json.loads(tags.get("tool.input", "{}"))
                 except Exception: inp = {}
                 uq = (inp.get("user_query") or "").strip()
                 dataset = str(inp.get("dataset") or "").upper()
                 is_probe = uq.lower() in EXCLUDED_QUERIES
+                try:    out_size = int(tags.get("tool.output_size") or 0)
+                except (TypeError, ValueError): out_size = 0
                 calls.append({
-                    "ts":         datetime.fromtimestamp(ts/1_000_000, tz=timezone.utc),
-                    "tool":       tool_name,
-                    "dataset":    dataset,
-                    "user_query": uq,
-                    "ua":         ua or "",
-                    "client":     classify_client(ua),
-                    "is_probe":   is_probe,
-                    "trace_id":   t.get("traceID", ""),
+                    "ts":          datetime.fromtimestamp(ts/1_000_000, tz=timezone.utc),
+                    "tool":        tool_name,
+                    "dataset":     dataset,
+                    "user_query":  uq,
+                    "ua":          ua,
+                    "client":      classify_client(ua),
+                    "is_probe":    is_probe,
+                    "duration_ms": s.get("duration", 0) / 1000.0,
+                    "out_bytes":   out_size,
+                    "error":       tags.get("otel.status_code") == "ERROR",
+                    "error_desc":  tags.get("otel.status_description", "") or "",
                 })
     calls.sort(key=lambda c: c["ts"])
     return calls
 
 
-def parse_syslog(path: Path, start_date, end_date):
-    """Returns list of {ts, cpu, ram_used_gi, ram_free_gi, ram_total_gi}."""
-    if not path.exists():
-        return []
-
+def parse_syslog(path, start_date, end_date):
+    if not path.exists(): return []
     def parse_gi(s):
         if not s: return None
         m = re.match(r"^\s*([\d.]+)\s*([KMG])i?\s*$", str(s))
         if not m: return None
         v, u = float(m.group(1)), m.group(2)
         return {"K": v/1024/1024, "M": v/1024, "G": v}[u]
-
-    if start_date:
-        start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
-    else:
-        start_us = 0
-    end_us = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
-
+    start_us = int(datetime.combine(start_date, datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
+    end_us   = int(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), TZ_IST).timestamp() * 1_000_000)
     leading = re.compile(r"(:\s*)\.(\d)")
     out = []
     with path.open() as f:
@@ -218,55 +237,107 @@ def parse_syslog(path: Path, start_date, end_date):
 # ---------------------------------------------------------------------------
 
 def aggregate(calls):
-    # Bucket real (non-probe) calls separately
     real = [c for c in calls if not c["is_probe"]]
+    if not real:
+        return {"n_real": 0, "n_probes": len(calls) - len(real)}
 
-    by_client_tool = Counter()           # (client, tool) -> n
+    by_client_tool = Counter()
     by_client      = Counter()
     by_tool        = Counter()
     by_dataset     = Counter()
-    by_client_ds   = Counter()           # (client, dataset)
-    by_tool_ds     = Counter()           # (tool, dataset)
-    distinct_ua_per_client = defaultdict(set)
+    by_client_ds   = Counter()
+    by_tool_ds     = Counter()
     by_hour_ist    = Counter()
     by_dow_ist     = Counter()
     by_day         = Counter()
+    junk_datasets  = Counter()
+    queries_total  = Counter()
     queries_per_client = defaultdict(Counter)
 
+    errors_by_tool   = Counter()
+    errors_by_client = Counter()
+    durations_ms     = []
+    durations_per_tool = defaultdict(list)
+    total_bytes      = 0
+    bytes_per_tool   = Counter()
+    bytes_per_client = Counter()
+
     for c in real:
-        client = c["client"]
-        tool   = c["tool"]
-        ds     = c["dataset"]
-        by_client_tool[(client, tool)] += 1
-        by_client[client] += 1
-        by_tool[tool]     += 1
-        if ds: by_dataset[ds] += 1
-        if ds: by_client_ds[(client, ds)] += 1
-        if ds: by_tool_ds[(tool, ds)] += 1
-        if c["ua"]: distinct_ua_per_client[client].add(c["ua"])
+        cl, tool, ds = c["client"], c["tool"], c["dataset"]
+        by_client_tool[(cl, tool)] += 1
+        by_client[cl] += 1
+        by_tool[tool] += 1
+        if ds:
+            if ds in KNOWN_DATASETS:
+                by_dataset[ds] += 1
+                by_client_ds[(cl, ds)] += 1
+                by_tool_ds[(tool, ds)] += 1
+            else:
+                junk_datasets[ds] += 1
         if c["user_query"]:
-            queries_per_client[client][c["user_query"]] += 1
+            queries_total[c["user_query"]] += 1
+            queries_per_client[cl][c["user_query"]] += 1
 
         d_ist = c["ts"].astimezone(TZ_IST)
-        by_hour_ist[d_ist.hour]              += 1
-        by_dow_ist[d_ist.strftime("%a")]     += 1
-        by_day[d_ist.strftime("%Y-%m-%d")]   += 1
+        by_hour_ist[d_ist.hour]           += 1
+        by_dow_ist[d_ist.strftime("%a")]  += 1
+        by_day[d_ist.strftime("%Y-%m-%d")] += 1
+
+        if c["error"]:
+            errors_by_tool[tool] += 1
+            errors_by_client[cl] += 1
+        durations_ms.append(c["duration_ms"])
+        durations_per_tool[tool].append(c["duration_ms"])
+        total_bytes      += c["out_bytes"]
+        bytes_per_tool[tool] += c["out_bytes"]
+        bytes_per_client[cl] += c["out_bytes"]
+
+    def quantile(arr, q):
+        if not arr: return 0
+        a = sorted(arr)
+        return a[int(q * (len(a) - 1))]
+
+    latency_per_tool = {}
+    for t, arr in durations_per_tool.items():
+        if not arr: continue
+        latency_per_tool[t] = {
+            "n":   len(arr),
+            "p50": quantile(arr, 0.5),
+            "p95": quantile(arr, 0.95),
+            "p99": quantile(arr, 0.99),
+            "max": max(arr),
+        }
 
     return {
         "n_total":          len(calls),
         "n_real":           len(real),
         "n_probes":         len(calls) - len(real),
+        "n_errors":         sum(errors_by_tool.values()),
+        "n_with_query":     sum(1 for c in real if c["user_query"]),
         "by_client_tool":   by_client_tool,
         "by_client":        by_client,
         "by_tool":          by_tool,
         "by_dataset":       by_dataset,
         "by_client_ds":     by_client_ds,
         "by_tool_ds":       by_tool_ds,
-        "distinct_ua":      distinct_ua_per_client,
+        "junk_datasets":    junk_datasets,
+        "queries_total":    queries_total,
+        "queries_per_client": queries_per_client,
         "by_hour_ist":      [by_hour_ist.get(h, 0) for h in range(24)],
         "by_dow_ist":       by_dow_ist,
         "by_day":           by_day,
-        "queries_per_client": queries_per_client,
+        "errors_by_tool":   errors_by_tool,
+        "errors_by_client": errors_by_client,
+        "latency_overall":  {
+            "p50": quantile(durations_ms, 0.5),
+            "p95": quantile(durations_ms, 0.95),
+            "p99": quantile(durations_ms, 0.99),
+            "max": max(durations_ms) if durations_ms else 0,
+        },
+        "latency_per_tool": latency_per_tool,
+        "total_bytes":      total_bytes,
+        "bytes_per_tool":   bytes_per_tool,
+        "bytes_per_client": bytes_per_client,
     }
 
 
@@ -289,14 +360,19 @@ def aggregate_cpu(samples):
 
 
 # ---------------------------------------------------------------------------
-# Inline SVG charts
+# Inline SVG
 # ---------------------------------------------------------------------------
 
 def esc(s): return html.escape(str(s))
 def fmt_int(n): return f"{int(n):,}"
+def fmt_bytes(b):
+    if b >= 1024*1024*1024: return f"{b/1024/1024/1024:.2f} GiB"
+    if b >= 1024*1024:      return f"{b/1024/1024:.2f} MiB"
+    if b >= 1024:           return f"{b/1024:.2f} KiB"
+    return f"{int(b)} B"
 
 
-def bar_chart_h(items, width=760, bar_h=22, gap=8, label_w=240, value_w=70):
+def bar_chart_h(items, width=760, bar_h=22, gap=8, label_w=240, value_w=70, accent=ACCENT):
     if not items: return '<div class="chart-empty">No data.</div>'
     n = len(items)
     chart_h = n * (bar_h + gap) + 12
@@ -308,10 +384,10 @@ def bar_chart_h(items, width=760, bar_h=22, gap=8, label_w=240, value_w=70):
         bw = (v / vmax) * plot_w
         parts.append(
             f'<text x="{label_w-10}" y="{y+bar_h*0.7:.1f}" text-anchor="end" '
-            f'font-family="Inter, sans-serif" font-size="13" fill="{INK}">{esc(lab)}</text>'
-            f'<rect x="{label_w}" y="{y}" width="{bw:.1f}" height="{bar_h}" fill="{ACCENT}" rx="2"/>'
+            f'font-family="Inter,sans-serif" font-size="13" fill="{INK}">{esc(lab)}</text>'
+            f'<rect x="{label_w}" y="{y}" width="{bw:.1f}" height="{bar_h}" fill="{accent}" rx="2"/>'
             f'<text x="{label_w + bw + 6:.1f}" y="{y+bar_h*0.7:.1f}" '
-            f'font-family="Inter, sans-serif" font-size="12" fill="{SUBTLE}">{fmt_int(v)}</text>'
+            f'font-family="Inter,sans-serif" font-size="12" fill="{SUBTLE}">{fmt_int(v)}</text>'
         )
     return f'<svg viewBox="0 0 {width} {chart_h}" xmlns="http://www.w3.org/2000/svg" class="chart">{"".join(parts)}</svg>'
 
@@ -331,10 +407,8 @@ def column_chart(values, labels, width=760, height=240, show_x_every=1):
             if k * exp >= v: return k * exp
         return v
     vmax_nice = nice(vmax)
-
     bar_w = plot_w / n * 0.7
     gap   = plot_w / n * 0.3
-
     bars, xlabs = [], []
     for i, v in enumerate(values):
         h = (v / vmax_nice) * plot_h if vmax_nice else 0
@@ -346,14 +420,14 @@ def column_chart(values, labels, width=760, height=240, show_x_every=1):
         if i % show_x_every: continue
         x = pad_l + i * (plot_w / n) + (plot_w / n) / 2
         xlabs.append(f'<text x="{x:.1f}" y="{height - pad_b + 16}" text-anchor="middle" '
-                     f'font-family="Inter, sans-serif" font-size="11" fill="{SUBTLE}">{esc(lab)}</text>')
+                     f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{esc(lab)}</text>')
     grid = []
     for ratio in (0, 0.5, 1.0):
         v = vmax_nice * ratio
         y = pad_t + plot_h - ratio * plot_h
         grid.append(f'<line x1="{pad_l}" x2="{width-pad_r}" y1="{y:.1f}" y2="{y:.1f}" stroke="{LINE}" stroke-width="1"/>')
         grid.append(f'<text x="{pad_l-6}" y="{y+3:.1f}" text-anchor="end" '
-                    f'font-family="Inter, sans-serif" font-size="11" fill="{SUBTLE}">{fmt_int(v)}</text>')
+                    f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{fmt_int(v)}</text>')
     return f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" class="chart">{"".join(grid)}{"".join(bars)}{"".join(xlabs)}</svg>'
 
 
@@ -366,7 +440,6 @@ def polyline_chart(points, width=760, height=240, y_max=None):
     values = [p[1] for p in points]
     t_min, t_max = min(times), max(times)
     t_range = max((t_max - t_min).total_seconds(), 1.0)
-
     if y_max is None:
         raw = max(values) if values else 1
         def nice(v):
@@ -376,13 +449,10 @@ def polyline_chart(points, width=760, height=240, y_max=None):
                 if k * exp >= v: return k * exp
             return v
         y_max = max(nice(raw), 1)
-
     def xpos(t): return pad_l + (t - t_min).total_seconds() / t_range * plot_w
     def ypos(v): return pad_t + plot_h - (v / y_max if y_max else 0) * plot_h
-
     pts = " ".join(f"{xpos(t):.1f},{ypos(v):.1f}" for t, v in points)
     area_pts = f"{pad_l:.1f},{pad_t+plot_h:.1f} {pts} {pad_l + plot_w:.1f},{pad_t+plot_h:.1f}"
-
     grid = []
     for ratio in (0, 0.5, 1.0):
         v = y_max * ratio
@@ -390,14 +460,12 @@ def polyline_chart(points, width=760, height=240, y_max=None):
         grid.append(f'<line x1="{pad_l}" x2="{width-pad_r}" y1="{y:.1f}" y2="{y:.1f}" stroke="{LINE}" stroke-width="1"/>')
         grid.append(f'<text x="{pad_l-6}" y="{y+3:.1f}" text-anchor="end" '
                     f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{v:.0f}%</text>')
-
     xlabs = [
         f'<text x="{pad_l:.0f}" y="{height-pad_b+16}" text-anchor="start" '
         f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{esc(t_min.astimezone(TZ_IST).strftime("%d %b %H:%M"))}</text>',
         f'<text x="{(width-pad_r):.0f}" y="{height-pad_b+16}" text-anchor="end" '
         f'font-family="Inter,sans-serif" font-size="11" fill="{SUBTLE}">{esc(t_max.astimezone(TZ_IST).strftime("%d %b %H:%M"))}</text>',
     ]
-
     return (f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" class="chart">'
             + "".join(grid)
             + f'<polygon points="{area_pts}" fill="{ACCENT_SOFT}" opacity="0.5"/>'
@@ -412,89 +480,118 @@ def kpi(label, value, sub=""):
       {f'<div class="kpi-sub">{sub}</div>' if sub else ''}</div>'''
 
 
+def mini_bar(value, vmax, color=ACCENT):
+    """Tiny inline horizontal bar for use inside table cells."""
+    if vmax <= 0: return ""
+    pct = max(2, min(100, int(value / vmax * 100)))
+    return (f'<span style="display:inline-block;width:{pct}%;height:6px;'
+            f'background:{color};border-radius:2px;vertical-align:middle"></span>')
+
+
 # ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
 
 def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
-    real_calls = [c for c in calls if not c["is_probe"]]
-    if not real_calls:
-        return f"<!doctype html><html><body><p>No tool calls in {start_date} to {end_date}.</p></body></html>"
+    if agg.get("n_real", 0) == 0:
+        period = f"{start_date} to {end_date}"
+        return (f"<!doctype html><html><body><p>No tool calls in "
+                f"{esc(period)} (excluding probes).</p></body></html>")
 
-    actual_start = real_calls[0]["ts"].astimezone(TZ_IST).date()
-    actual_end   = real_calls[-1]["ts"].astimezone(TZ_IST).date()
-    window_start = start_date or actual_start
-    window_end   = end_date
-
-    period_str = f"{window_start.strftime('%d %B %Y')} to {window_end.strftime('%d %B %Y')}"
+    period_str = f"{start_date.strftime('%d %B %Y')} to {end_date.strftime('%d %B %Y')}"
     generated  = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
 
-    # Charts: clients, tools, datasets
-    client_chart  = bar_chart_h(agg["by_client"].most_common(top_n), label_w=200)
-    tool_order = STEP_NAMES + sorted(set(agg["by_tool"]) - set(STEP_NAMES))
-    tool_chart    = bar_chart_h([(t, agg["by_tool"].get(t, 0)) for t in tool_order
-                                  if agg["by_tool"].get(t, 0) > 0], label_w=200)
-    dataset_chart = bar_chart_h(agg["by_dataset"].most_common(top_n), label_w=110)
-
-    # Per-client x per-tool table (matrix)
+    # --- per-client x per-tool matrix (Section 1 - the main view) ----------
     clients_ranked = [c for c, _ in agg["by_client"].most_common()]
-    matrix_html = ""
-    if clients_ranked:
-        header = "<tr><th>Client</th>" + "".join(f"<th>{esc(t)}</th>" for t in tool_order) + "<th>Total</th></tr>"
-        rows = []
-        for cl in clients_ranked:
-            row = [f"<td>{esc(cl)}</td>"]
-            for t in tool_order:
-                v = agg["by_client_tool"].get((cl, t), 0)
-                row.append(f'<td class="num">{fmt_int(v) if v else "&middot;"}</td>')
-            row.append(f'<td class="num"><strong>{fmt_int(agg["by_client"][cl])}</strong></td>')
-            rows.append("<tr>" + "".join(row) + "</tr>")
-        matrix_html = (
-            '<table class="data"><thead>' + header + '</thead><tbody>'
-            + "".join(rows) + '</tbody></table>'
-        )
+    tool_order = STEP_NAMES + sorted(set(agg["by_tool"]) - set(STEP_NAMES))
+    tool_order = [t for t in tool_order if agg["by_tool"].get(t, 0) > 0]
 
-    # Distinct UAs per client (so the reader can see raw strings)
-    ua_table_html = ""
-    rows = []
+    head_cells = "".join(f'<th>{esc(t)}</th>' for t in tool_order) + '<th>Total</th>'
+    body_rows = []
+    grand_total = sum(agg["by_client"].values())
     for cl in clients_ranked:
-        uas = sorted(agg["distinct_ua"].get(cl, []))
-        if not uas: continue
-        rows.append(f'<tr><td>{esc(cl)}</td><td>{esc(", ".join(uas[:6]))}'
-                    + (f' <span class="meta">+{len(uas)-6} more</span>' if len(uas) > 6 else '')
-                    + f'</td></tr>')
-    if rows:
-        ua_table_html = (
-            '<table class="data"><thead><tr><th>Client bucket</th>'
-            '<th>Raw user_agent strings</th></tr></thead><tbody>'
-            + "".join(rows) + '</tbody></table>'
-        )
+        cells = [f'<td><strong>{esc(cl)}</strong></td>']
+        for t in tool_order:
+            v = agg["by_client_tool"].get((cl, t), 0)
+            cells.append(f'<td class="num">{fmt_int(v) if v else "&middot;"}</td>')
+        total = agg["by_client"][cl]
+        share_pct = total/grand_total*100 if grand_total else 0
+        cells.append(f'<td class="num"><strong>{fmt_int(total)}</strong> '
+                     f'<span class="meta">{share_pct:.1f}%</span></td>')
+        body_rows.append('<tr>' + ''.join(cells) + '</tr>')
+    matrix_html = (
+        '<table class="data wide"><thead>'
+        f'<tr><th>Client</th>{head_cells}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table>'
+    )
 
-    # Datasets per client (top 3 datasets for each top client)
+    # --- tool-name overall distribution (small) ----------------------------
+    tool_chart = bar_chart_h(
+        [(t, agg["by_tool"].get(t, 0)) for t in tool_order], label_w=160)
+
+    # --- dataset usage (verified) ------------------------------------------
+    dataset_chart = bar_chart_h(agg["by_dataset"].most_common(), label_w=110)
+    junk_note = ""
+    if agg["junk_datasets"]:
+        n_junk = sum(agg["junk_datasets"].values())
+        examples = ", ".join(f"{esc(d)} ({n})" for d, n in agg["junk_datasets"].most_common(5))
+        junk_note = (f'<p class="meta" style="margin-top:8px">{n_junk} call(s) '
+                     f'referenced invalid dataset values (e.g. {examples}). '
+                     f'Excluded from this chart.</p>')
+
+    # Per-client dataset detail with inline mini-bars
     ds_per_client_rows = []
-    for cl in clients_ranked[:8]:
+    for cl in clients_ranked:
         per = Counter({ds: agg["by_client_ds"][(cl, ds)] for ds in agg["by_dataset"]
                        if (cl, ds) in agg["by_client_ds"]})
         if not per: continue
-        top_ds = ", ".join(f"{ds} ({n})" for ds, n in per.most_common(5))
-        ds_per_client_rows.append(f'<tr><td>{esc(cl)}</td><td>{esc(top_ds)}</td></tr>')
-    ds_per_client_html = ""
-    if ds_per_client_rows:
-        ds_per_client_html = (
-            '<table class="data"><thead><tr><th>Client</th>'
-            '<th>Top datasets (count)</th></tr></thead><tbody>'
-            + "".join(ds_per_client_rows) + '</tbody></table>'
+        top = per.most_common(6)
+        vmax = top[0][1] if top else 1
+        chips = "".join(
+            f'<div class="ds-chip">'
+            f'<span class="ds-name">{esc(ds)}</span>'
+            f'<span class="ds-bar">{mini_bar(n, vmax)}</span>'
+            f'<span class="ds-num">{fmt_int(n)}</span>'
+            f'</div>' for ds, n in top
         )
+        ds_per_client_rows.append(f'<tr><td><strong>{esc(cl)}</strong></td>'
+                                  f'<td><div class="ds-grid">{chips}</div></td></tr>')
+    ds_per_client_html = (
+        '<table class="data"><thead><tr><th>Client</th><th>Top datasets</th></tr></thead>'
+        f'<tbody>{"".join(ds_per_client_rows)}</tbody></table>'
+    )
 
-    # Time charts
+    # --- top queries (across clients) --------------------------------------
+    queries_html = ""
+    top_queries = agg["queries_total"].most_common(20)
+    if top_queries:
+        rows = []
+        # Per-query, also list the clients that asked it
+        for q, n in top_queries:
+            clients_for_q = []
+            for cl, qs in agg["queries_per_client"].items():
+                if q in qs:
+                    clients_for_q.append(f"{cl} ({qs[q]})")
+            rows.append(
+                f'<tr><td class="num">{n}</td>'
+                f'<td class="q">{esc(q[:140])}</td>'
+                f'<td class="meta">{esc(", ".join(clients_for_q))}</td></tr>'
+            )
+        queries_html = (
+            '<table class="data"><thead>'
+            '<tr><th>Times</th><th>Query</th><th>Asked by</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table>'
+        )
+    else:
+        queries_html = '<p class="meta">No natural-language queries in this window.</p>'
+
+    # --- time charts -------------------------------------------------------
     hour_chart  = column_chart(agg["by_hour_ist"], [f"{h:02d}" for h in range(24)], show_x_every=2)
     dow_order   = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     dow_chart   = column_chart([agg["by_dow_ist"].get(d, 0) for d in dow_order], dow_order)
-
-    # Daily volume
     if agg["by_day"]:
-        cur = window_start; daily_labs, daily_vals = [], []
-        while cur <= window_end:
+        cur = start_date; daily_labs, daily_vals = [], []
+        while cur <= end_date:
             daily_labs.append(cur.strftime("%m-%d"))
             daily_vals.append(agg["by_day"].get(cur.strftime("%Y-%m-%d"), 0))
             cur += timedelta(days=1)
@@ -502,76 +599,80 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
     else:
         daily_chart = '<div class="chart-empty">No data.</div>'
 
-    # CPU section (optional)
+    # --- CPU section (only if samples) ------------------------------------
     cpu_section_html = ""
     if syslog_samples:
         cc = aggregate_cpu(syslog_samples)
-        cpu_line  = polyline_chart([(s["ts"], s["cpu"]) for s in syslog_samples], y_max=100)
+        cpu_line = polyline_chart([(s["ts"], s["cpu"]) for s in syslog_samples], y_max=100)
         per_hr = defaultdict(list)
         for s in syslog_samples:
             per_hr[s["ts"].astimezone(TZ_IST).hour].append(s["cpu"])
         hr_means = [(sum(per_hr[h])/len(per_hr[h]) if per_hr.get(h) else 0) for h in range(24)]
         cpu_hour_chart = column_chart(hr_means, [f"{h:02d}" for h in range(24)], show_x_every=2)
         peak_when = cc["peak_time"].astimezone(TZ_IST).strftime("%d %b %H:%M")
+
         spike_html = ""
         if cc["spikes"]:
             sr = "".join(
                 f'<tr><td>{s["ts"].astimezone(TZ_IST).strftime("%d %b %H:%M:%S")}</td>'
                 f'<td class="num">{s["cpu"]:.1f}%</td>'
-                f'<td>{s["ram_used_gi"]:.2f} GiB</td></tr>'
+                f'<td>{(s["ram_used_gi"] or 0):.2f} GiB</td></tr>'
                 for s in cc["spikes"]
             )
-            spike_html = (
-                '<h3>Top CPU spikes (&gt;= 50%)</h3>'
-                '<table class="data"><thead>'
-                '<tr><th>When (IST)</th><th>CPU</th><th>RAM used</th></tr>'
-                f'</thead><tbody>{sr}</tbody></table>'
-            )
+            spike_html = ('<h3>Top CPU spikes (&gt;= 50%)</h3>'
+                          '<table class="data"><thead>'
+                          '<tr><th>When (IST)</th><th>CPU</th><th>RAM used</th></tr>'
+                          f'</thead><tbody>{sr}</tbody></table>')
+
         free_vals = [s["ram_free_gi"] for s in syslog_samples if s["ram_free_gi"] is not None]
         ram_note = ""
         if free_vals:
             tot = next((s["ram_total_gi"] for s in syslog_samples if s["ram_total_gi"]), None)
             mu  = max(s["ram_used_gi"] for s in syslog_samples if s["ram_used_gi"] is not None)
-            ram_note = (
-                f'<p class="meta" style="margin-top:14px">'
-                f'RAM: lowest free <strong>{min(free_vals):.2f} GiB</strong> of '
-                f'{tot:.1f} GiB; max used <strong>{mu:.2f} GiB</strong>.'
-                f'</p>'
-            )
+            ram_note = (f'<p class="meta" style="margin-top:14px">'
+                        f'RAM: lowest free <strong>{min(free_vals):.2f} GiB</strong> of '
+                        f'{tot:.1f} GiB; max used <strong>{mu:.2f} GiB</strong>.</p>')
+
         cpu_section_html = f'''
-  <h2>5 &middot; MCP server CPU usage</h2>
+  <h2>2 &middot; MCP server CPU usage</h2>
   <div class="kpis">
     {kpi("Median CPU", f"{cc['median']:.1f}%")}
     {kpi("Mean CPU",   f"{cc['mean']:.1f}%")}
     {kpi("Peak",       f"{cc['max']:.1f}%", esc(peak_when))}
     {kpi("Samples",    fmt_int(cc['n']))}
   </div>
-
   <h3>CPU% over time</h3>
   {cpu_line}
-
   <h3>Mean CPU by hour of day (IST)</h3>
   {cpu_hour_chart}
-
   {spike_html}
   {ram_note}
 '''
 
-    # Recent calls timeline
-    recent = list(reversed(real_calls[-30:]))
-    recent_rows = "".join(
-        f'<tr><td>{c["ts"].astimezone(TZ_IST).strftime("%d %b %H:%M:%S")}</td>'
-        f'<td>{esc(c["client"])}</td>'
-        f'<td><span class="op">{esc(c["tool"])}</span></td>'
-        f'<td>{esc(c["dataset"] or "-")}</td>'
-        f'<td class="q">{esc((c["user_query"] or "")[:80])}</td></tr>'
-        for c in recent
-    )
-    recent_html = (
-        '<table class="data"><thead>'
-        '<tr><th>When (IST)</th><th>Client</th><th>Tool</th>'
-        '<th>Dataset</th><th>Query</th></tr></thead>'
-        f'<tbody>{recent_rows}</tbody></table>'
+    # --- reliability + latency --------------------------------------------
+    lat = agg["latency_overall"]
+    lat_rows = []
+    for t in tool_order:
+        if t not in agg["latency_per_tool"]: continue
+        L = agg["latency_per_tool"][t]
+        err_n = agg["errors_by_tool"].get(t, 0)
+        n = L["n"]
+        err_rate = (err_n/n*100) if n else 0
+        lat_rows.append(
+            f'<tr><td><span class="op">{esc(t)}</span></td>'
+            f'<td class="num">{fmt_int(n)}</td>'
+            f'<td class="num">{L["p50"]:.0f} ms</td>'
+            f'<td class="num">{L["p95"]:.0f} ms</td>'
+            f'<td class="num">{L["p99"]:.0f} ms</td>'
+            f'<td class="num">{L["max"]:.0f} ms</td>'
+            f'<td class="num">{err_n} <span class="meta">({err_rate:.2f}%)</span></td>'
+            f'<td class="num">{fmt_bytes(agg["bytes_per_tool"].get(t, 0))}</td></tr>'
+        )
+    lat_table = (
+        '<table class="data wide"><thead>'
+        '<tr><th>Tool</th><th>Calls</th><th>p50</th><th>p95</th><th>p99</th>'
+        '<th>max</th><th>Errors</th><th>Bytes returned</th></tr></thead>'
+        f'<tbody>{"".join(lat_rows)}</tbody></table>'
     )
 
     # Probe note
@@ -581,8 +682,26 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
                       f'{fmt_int(agg["n_probes"])} automated health-check calls excluded from these counts.'
                       f'</p>')
 
-    cpu_section_num = 5 if syslog_samples else None
-    next_sec        = 6 if cpu_section_num else 5
+    # KPI strip
+    err_rate_overall = (agg["n_errors"]/agg["n_real"]*100) if agg["n_real"] else 0
+    kpis_html = "".join([
+        kpi("Distinct clients", fmt_int(len(agg["by_client"]))),
+        kpi("Datasets queried", fmt_int(len(agg["by_dataset"]))),
+        kpi("p95 latency",      f"{lat['p95']:.0f} ms"),
+        kpi("Errors",           f"{agg['n_errors']}", f"{err_rate_overall:.2f}% of calls"),
+        kpi("Bytes served",     fmt_bytes(agg["total_bytes"])),
+    ])
+
+    # Section numbering (CPU is 2 only if present)
+    s = 1
+    sec_matrix    = s; s += 1
+    sec_cpu       = s if syslog_samples else None
+    if syslog_samples: s += 1
+    sec_tooldist  = s; s += 1
+    sec_dataset   = s; s += 1
+    sec_queries   = s; s += 1
+    sec_time      = s; s += 1
+    sec_reliab    = s; s += 1
 
     return f'''<!doctype html>
 <html lang="en">
@@ -596,39 +715,47 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
 <style>
   :root {{
     --ink: {INK}; --subtle: {SUBTLE}; --muted: {MUTED}; --line: {LINE};
-    --bg: #fbfaf7; --paper: #ffffff; --accent: {ACCENT}; --accent-soft: {ACCENT_SOFT};
+    --bg: #fbfaf7; --paper: #ffffff; --accent: {ACCENT}; --accent-soft: {ACCENT_SOFT}; --warn: {WARN};
   }}
   * {{ box-sizing: border-box; }}
   html, body {{ background: var(--bg); color: var(--ink); margin: 0; padding: 0;
                 font-family: 'Inter', system-ui, sans-serif; line-height: 1.55; -webkit-font-smoothing: antialiased; }}
-  .page {{ max-width: 940px; margin: 0 auto; padding: 64px 64px 80px; background: var(--paper); box-shadow: 0 1px 0 var(--line); }}
+  .page {{ max-width: 960px; margin: 0 auto; padding: 56px 56px 80px; background: var(--paper); box-shadow: 0 1px 0 var(--line); }}
   h1, h2, h3, h4 {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; color: var(--ink); margin: 0; letter-spacing: -0.01em; }}
-  h1 {{ font-size: 38px; line-height: 1.1; margin-bottom: 10px; }}
-  h2 {{ font-size: 26px; margin-top: 56px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }}
-  h3 {{ font-size: 19px; margin-top: 28px; margin-bottom: 10px; }}
+  h1 {{ font-size: 36px; line-height: 1.1; margin-bottom: 10px; }}
+  h2 {{ font-size: 24px; margin-top: 52px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }}
+  h3 {{ font-size: 18px; margin-top: 24px; margin-bottom: 10px; }}
   p, li {{ font-size: 15px; color: var(--ink); }}
   .meta {{ color: var(--subtle); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; margin: 0; }}
 
-  .hero {{ margin: 32px 0 24px; padding: 28px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }}
-  .hero-value {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 70px; line-height: 1; letter-spacing: -0.02em; }}
-  .hero-label {{ font-size: 14px; color: var(--subtle); margin-top: 10px; }}
+  .hero {{ margin: 30px 0 22px; padding: 24px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }}
+  .hero-value {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 64px; line-height: 1; letter-spacing: -0.02em; }}
+  .hero-label {{ font-size: 14px; color: var(--subtle); margin-top: 8px; }}
 
-  .kpis {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin: 0 0 22px; border-bottom: 1px solid var(--line); }}
-  .kpi {{ padding: 18px 14px 20px 0; border-right: 1px solid var(--line); }}
-  .kpi:last-child {{ border-right: 0; padding-left: 14px; }}
-  .kpi-value {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 26px; line-height: 1.1; }}
-  .kpi-label {{ font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--subtle); margin-top: 6px; }}
-  .kpi-sub  {{ font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .kpis {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 0; margin: 0 0 20px; border-bottom: 1px solid var(--line); }}
+  .kpi {{ padding: 16px 12px 18px 0; border-right: 1px solid var(--line); }}
+  .kpi:last-child {{ border-right: 0; padding-left: 12px; }}
+  .kpi-value {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; font-size: 24px; line-height: 1.1; }}
+  .kpi-label {{ font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--subtle); margin-top: 5px; }}
+  .kpi-sub  {{ font-size: 11px; color: var(--muted); margin-top: 3px; }}
 
-  .chart {{ width: 100%; height: auto; max-width: 820px; }}
+  .chart {{ width: 100%; height: auto; max-width: 880px; }}
   .chart-empty {{ font-size: 13px; color: var(--subtle); padding: 14px 0; }}
 
   table.data {{ width: 100%; border-collapse: collapse; margin: 12px 0 8px; font-size: 14px; }}
-  table.data th, table.data td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }}
+  table.data th, table.data td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }}
   table.data th {{ font-weight: 500; color: var(--subtle); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }}
   table.data td.num {{ font-variant-numeric: tabular-nums; text-align: right; width: 1%; white-space: nowrap; color: var(--ink); }}
-  table.data td.q {{ font-family: 'EB Garamond', Georgia, serif; font-size: 15px; color: var(--ink); }}
+  table.data td.q {{ font-family: 'EB Garamond', Georgia, serif; font-size: 16px; color: var(--ink); }}
+  table.data.wide {{ font-size: 13px; }}
+  table.data.wide td {{ padding: 8px 8px; }}
   .op {{ font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--accent); }}
+
+  .ds-grid {{ display: grid; grid-template-columns: minmax(0,1fr); row-gap: 4px; }}
+  .ds-chip {{ display: grid; grid-template-columns: 80px 1fr 48px; align-items: center; gap: 8px; font-size: 13px; }}
+  .ds-name {{ font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--ink); }}
+  .ds-bar  {{ display: block; height: 6px; }}
+  .ds-num  {{ font-variant-numeric: tabular-nums; text-align: right; color: var(--subtle); font-size: 12px; }}
 
   .footer {{ margin-top: 56px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }}
 </style>
@@ -638,7 +765,7 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
 
   <header>
     <h1>MoSPI MCP - Full Engagement Report</h1>
-    <p class="meta">{esc(period_str)}  &middot;  Generated {esc(generated)}</p>
+    <p class="meta">{esc(period_str)} &middot; Generated {esc(generated)}</p>
   </header>
 
   <div class="hero">
@@ -647,50 +774,43 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
     {probe_note}
   </div>
 
-  <div class="kpis">
-    {kpi("Distinct clients", fmt_int(len(agg["by_client"])))}
-    {kpi("Datasets queried", fmt_int(len(agg["by_dataset"])))}
-    {kpi("Active days", fmt_int(len(agg["by_day"])))}
-    {kpi("Period", f"{(window_end - window_start).days + 1} days")}
-  </div>
+  <div class="kpis">{kpis_html}</div>
 
-  <h2>1 &middot; Clients</h2>
-  <p>Tool calls grouped by client, derived from the <span class="op">http.user_agent</span> /
-     <span class="op">user_agent.original</span> tags on each trace.</p>
-  {client_chart}
-
-  <h3>What each bucket looked like (raw user_agent strings)</h3>
-  {ua_table_html}
-
-  <h2>2 &middot; Tool calls</h2>
-  <p>Distribution across the four MCP tools.</p>
-  {tool_chart}
-
-  <h3>Per-client breakdown</h3>
+  <h2>{sec_matrix} &middot; Tool calls by client</h2>
+  <p>The primary view: who is using the MCP and which tools they hit. Counts are based
+     on the <span class="op">http.user_agent</span> tag on each trace.</p>
   {matrix_html}
 
-  <h2>3 &middot; Dataset usage</h2>
-  <p>Datasets touched across all real tool calls.</p>
+  {cpu_section_html}
+
+  <h2>{sec_tooldist} &middot; Tool distribution overall</h2>
+  {tool_chart}
+
+  <h2>{sec_dataset} &middot; Dataset usage</h2>
+  <p>Datasets touched across all real tool calls, restricted to the list of
+     known MoSPI sources.</p>
   {dataset_chart}
+  {junk_note}
 
   <h3>Top datasets per client</h3>
   {ds_per_client_html}
 
-  <h2>4 &middot; Activity over time</h2>
+  <h2>{sec_queries} &middot; Top user queries</h2>
+  <p>Natural-language questions sent on the <span class="op">tool.input.user_query</span> field, ranked by frequency.
+     {fmt_int(agg["n_with_query"])} of {fmt_int(agg["n_real"])} tool calls carried a written query.</p>
+  {queries_html}
 
+  <h2>{sec_time} &middot; Activity over time</h2>
   <h3>By hour of day (IST)</h3>
   {hour_chart}
-
   <h3>By day of week</h3>
   {dow_chart}
-
   <h3>Daily volume</h3>
   {daily_chart}
 
-  {cpu_section_html}
-
-  <h2>{next_sec} &middot; Recent tool calls</h2>
-  {recent_html}
+  <h2>{sec_reliab} &middot; Reliability and latency</h2>
+  <p>Per-tool latency percentiles, error counts, and bytes returned.</p>
+  {lat_table}
 
   <div class="footer">
     {esc(period_str)} &middot; Generated {esc(generated)}
@@ -698,6 +818,41 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
 </div>
 </body>
 </html>'''
+
+
+# ---------------------------------------------------------------------------
+# Email
+# ---------------------------------------------------------------------------
+
+def send_email(args, html_doc, subject, attachment_path):
+    recipients = [r.strip() for r in args.email.split(",") if r.strip()]
+    if not recipients:
+        return False
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["From"]    = args.from_addr
+    msg["To"]      = ", ".join(recipients)
+    msg.attach(MIMEText(html_doc, "html", "utf-8"))
+    if attachment_path:
+        with open(attachment_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="html")
+        att.add_header("Content-Disposition", "attachment",
+                       filename=Path(attachment_path).name)
+        msg.attach(att)
+    try:
+        with smtplib.SMTP(args.smtp_host, args.smtp_port, timeout=30) as s:
+            s.ehlo()
+            if args.smtp_port == 587:
+                s.starttls(); s.ehlo()
+            if args.smtp_user:
+                s.login(args.smtp_user, args.smtp_pass)
+            s.sendmail(args.from_addr, recipients, msg.as_string())
+        print(f"[email] sent to {len(recipients)} recipient(s) via "
+              f"{args.smtp_host}:{args.smtp_port}", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"[email] FAILED: {e}", file=sys.stderr)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -712,8 +867,6 @@ def default_output_path():
 def main():
     args = parse_args()
     start_date, end_date = resolve_window(args)
-    if start_date is None:
-        start_date = (end_date - timedelta(days=7))   # last 7 days by default
 
     traces_path = Path(os.path.expanduser(args.traces))
     syslog_path = Path(os.path.expanduser(args.syslog))
@@ -727,8 +880,11 @@ def main():
           f"({start_date} to {end_date})", file=sys.stderr)
 
     agg = aggregate(calls)
-    print(f"[aggregate] {agg['n_real']:,} real, {agg['n_probes']:,} probes, "
-          f"{len(agg['by_client'])} clients", file=sys.stderr)
+    print(f"[aggregate] {agg.get('n_real',0):,} real, "
+          f"{agg.get('n_probes',0):,} probes, "
+          f"{len(agg.get('by_client',{}))} clients, "
+          f"{len(agg.get('by_dataset',{}))} datasets",
+          file=sys.stderr)
 
     syslog_samples = []
     if not args.no_syslog:
@@ -741,6 +897,12 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html_doc)
     print(f"[write] {out_path}  ({out_path.stat().st_size:,} bytes)", file=sys.stderr)
+
+    if args.email:
+        subject = args.subject or (
+            f"MoSPI MCP weekly report - {start_date} to {end_date}"
+        )
+        send_email(args, html_doc, subject, out_path)
 
 
 if __name__ == "__main__":
