@@ -28,14 +28,17 @@ Examples
         --smtp-user noreply@example.com
 """
 import argparse
+import csv
 import html
 import json
 import math
 import os
 import re
+import shutil
 import smtplib
 import socket
 import statistics
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
@@ -85,6 +88,8 @@ def parse_args():
     p.add_argument("--output",  default=None,
                    help="HTML output path. Default: ./mospi-full-report-<stamp>.html")
     p.add_argument("--no-syslog", action="store_true", help="Skip the CPU section.")
+    p.add_argument("--no-pdf",  action="store_true",
+                   help="Skip PDF rendering; email the HTML instead.")
     p.add_argument("--top",     type=int, default=12, help="Cap for top-N lists.")
     # email
     p.add_argument("--email",   default="",
@@ -156,15 +161,28 @@ def parse_traces(path, start_date, end_date):
             try:    t = json.loads(line)
             except Exception: continue
 
+            # The real client UA is http.user_agent on the inbound server span
+            # for POST /mcp. Do NOT read user_agent.original: that is the MCP
+            # server's OWN outbound UA when it fetches from api.mospi.gov.in
+            # (it sends "Mozilla/5.0"), which would mis-attribute the trace.
             ua = ""
             for s in t.get("spans", []):
-                for tag in s.get("tags", []):
-                    if tag["key"] in ("http.user_agent", "user_agent.original"):
-                        v = str(tag.get("value", "") or "")
-                        if v:
-                            ua = v
-                            break
-                if ua: break
+                stags = {tg["key"]: tg.get("value") for tg in s.get("tags", [])}
+                if stags.get("span.kind") == "server" and stags.get("http.route") == "/mcp":
+                    v = stags.get("http.user_agent")
+                    if v:
+                        ua = str(v)
+                        break
+            if not ua:
+                # fallback: any http.user_agent tag (never user_agent.original)
+                for s in t.get("spans", []):
+                    for tag in s.get("tags", []):
+                        if tag["key"] == "http.user_agent":
+                            v = str(tag.get("value", "") or "")
+                            if v:
+                                ua = v
+                                break
+                    if ua: break
 
             for s in t.get("spans", []):
                 op = s.get("operationName", "")
@@ -237,9 +255,10 @@ def parse_syslog(path, start_date, end_date):
 # ---------------------------------------------------------------------------
 
 def aggregate(calls):
-    real = [c for c in calls if not c["is_probe"]]
+    # All calls counted, no probe exclusion.
+    real = calls
     if not real:
-        return {"n_real": 0, "n_probes": len(calls) - len(real)}
+        return {"n_real": 0, "n_probes": 0}
 
     by_client_tool = Counter()
     by_client      = Counter()
@@ -502,7 +521,15 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
     generated  = datetime.now(TZ_IST).strftime("%d %B %Y, %H:%M IST")
 
     # --- per-client x per-tool matrix (Section 1 - the main view) ----------
-    clients_ranked = [c for c, _ in agg["by_client"].most_common()]
+    # Sort: Claude family first, then ChatGPT, then everyone else by call count.
+    PRIORITY = ["Claude", "Claude Code CLI", "ChatGPT (OpenAI)", "Gemini (Google)"]
+    HIGHLIGHTED = set(PRIORITY)
+    others = sorted(
+        (c for c in agg["by_client"] if c not in HIGHLIGHTED),
+        key=lambda c: -agg["by_client"][c],
+    )
+    clients_ranked = [c for c in PRIORITY if c in agg["by_client"]] + others
+
     tool_order = STEP_NAMES + sorted(set(agg["by_tool"]) - set(STEP_NAMES))
     tool_order = [t for t in tool_order if agg["by_tool"].get(t, 0) > 0]
 
@@ -510,6 +537,7 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
     body_rows = []
     grand_total = sum(agg["by_client"].values())
     for cl in clients_ranked:
+        row_class = ' class="hi"' if cl in HIGHLIGHTED else ''
         cells = [f'<td><strong>{esc(cl)}</strong></td>']
         for t in tool_order:
             v = agg["by_client_tool"].get((cl, t), 0)
@@ -518,7 +546,7 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
         share_pct = total/grand_total*100 if grand_total else 0
         cells.append(f'<td class="num"><strong>{fmt_int(total)}</strong> '
                      f'<span class="meta">{share_pct:.1f}%</span></td>')
-        body_rows.append('<tr>' + ''.join(cells) + '</tr>')
+        body_rows.append(f'<tr{row_class}>' + ''.join(cells) + '</tr>')
     matrix_html = (
         '<table class="data wide"><thead>'
         f'<tr><th>Client</th>{head_cells}</tr></thead>'
@@ -531,13 +559,7 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
 
     # --- dataset usage (verified) ------------------------------------------
     dataset_chart = bar_chart_h(agg["by_dataset"].most_common(), label_w=110)
-    junk_note = ""
-    if agg["junk_datasets"]:
-        n_junk = sum(agg["junk_datasets"].values())
-        examples = ", ".join(f"{esc(d)} ({n})" for d, n in agg["junk_datasets"].most_common(5))
-        junk_note = (f'<p class="meta" style="margin-top:8px">{n_junk} call(s) '
-                     f'referenced invalid dataset values (e.g. {examples}). '
-                     f'Excluded from this chart.</p>')
+    junk_note = ""  # silently exclude junk dataset names; no commentary
 
     # Per-client dataset detail with inline mini-bars
     ds_per_client_rows = []
@@ -561,25 +583,29 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
         f'<tbody>{"".join(ds_per_client_rows)}</tbody></table>'
     )
 
-    # --- top queries (across clients) --------------------------------------
+    # --- top queries: longest 50, deduped, probes filtered out of this list --
     queries_html = ""
-    top_queries = agg["queries_total"].most_common(20)
+    candidates = [
+        (q, n) for q, n in agg["queries_total"].items()
+        if q.strip().lower() not in EXCLUDED_QUERIES
+    ]
+    candidates.sort(key=lambda kv: -len(kv[0]))   # longest first
+    top_queries = candidates[:50]
+
     if top_queries:
         rows = []
-        # Per-query, also list the clients that asked it
         for q, n in top_queries:
             clients_for_q = []
             for cl, qs in agg["queries_per_client"].items():
                 if q in qs:
                     clients_for_q.append(f"{cl} ({qs[q]})")
             rows.append(
-                f'<tr><td class="num">{n}</td>'
-                f'<td class="q">{esc(q[:140])}</td>'
+                f'<tr><td class="q">{esc(q)}</td>'
                 f'<td class="meta">{esc(", ".join(clients_for_q))}</td></tr>'
             )
         queries_html = (
             '<table class="data"><thead>'
-            '<tr><th>Times</th><th>Query</th><th>Asked by</th></tr></thead>'
+            '<tr><th>Query (longest first)</th><th>Asked by</th></tr></thead>'
             f'<tbody>{"".join(rows)}</tbody></table>'
         )
     else:
@@ -598,6 +624,15 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
         daily_chart = column_chart(daily_vals, daily_labs, show_x_every=max(1, len(daily_labs)//12))
     else:
         daily_chart = '<div class="chart-empty">No data.</div>'
+
+    # Section numbering - CPU goes at the END. Dataset usage section removed.
+    _s = 1
+    sec_matrix    = _s; _s += 1
+    sec_tooldist  = _s; _s += 1
+    sec_queries   = _s; _s += 1
+    sec_time      = _s; _s += 1
+    sec_reliab    = _s; _s += 1
+    sec_cpu       = _s if syslog_samples else None
 
     # --- CPU section (only if samples) ------------------------------------
     cpu_section_html = ""
@@ -634,7 +669,7 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
                         f'{tot:.1f} GiB; max used <strong>{mu:.2f} GiB</strong>.</p>')
 
         cpu_section_html = f'''
-  <h2>2 &middot; MCP server CPU usage</h2>
+  <h2>{{cpu_sn}} &middot; MCP server CPU usage</h2>
   <div class="kpis">
     {kpi("Median CPU", f"{cc['median']:.1f}%")}
     {kpi("Mean CPU",   f"{cc['mean']:.1f}%")}
@@ -648,6 +683,7 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
   {spike_html}
   {ram_note}
 '''
+        cpu_section_html = cpu_section_html.format(cpu_sn=sec_cpu)
 
     # --- reliability + latency --------------------------------------------
     lat = agg["latency_overall"]
@@ -675,33 +711,8 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
         f'<tbody>{"".join(lat_rows)}</tbody></table>'
     )
 
-    # Probe note
-    probe_note = ""
-    if agg["n_probes"]:
-        probe_note = (f'<p class="meta" style="margin-top:6px">'
-                      f'{fmt_int(agg["n_probes"])} automated health-check calls excluded from these counts.'
-                      f'</p>')
+    probe_note = ""  # probes are no longer excluded
 
-    # KPI strip
-    err_rate_overall = (agg["n_errors"]/agg["n_real"]*100) if agg["n_real"] else 0
-    kpis_html = "".join([
-        kpi("Distinct clients", fmt_int(len(agg["by_client"]))),
-        kpi("Datasets queried", fmt_int(len(agg["by_dataset"]))),
-        kpi("p95 latency",      f"{lat['p95']:.0f} ms"),
-        kpi("Errors",           f"{agg['n_errors']}", f"{err_rate_overall:.2f}% of calls"),
-        kpi("Bytes served",     fmt_bytes(agg["total_bytes"])),
-    ])
-
-    # Section numbering (CPU is 2 only if present)
-    s = 1
-    sec_matrix    = s; s += 1
-    sec_cpu       = s if syslog_samples else None
-    if syslog_samples: s += 1
-    sec_tooldist  = s; s += 1
-    sec_dataset   = s; s += 1
-    sec_queries   = s; s += 1
-    sec_time      = s; s += 1
-    sec_reliab    = s; s += 1
 
     return f'''<!doctype html>
 <html lang="en">
@@ -722,7 +733,9 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
                 font-family: 'Inter', system-ui, sans-serif; line-height: 1.55; -webkit-font-smoothing: antialiased; }}
   .page {{ max-width: 960px; margin: 0 auto; padding: 56px 56px 80px; background: var(--paper); box-shadow: 0 1px 0 var(--line); }}
   h1, h2, h3, h4 {{ font-family: 'EB Garamond', Georgia, serif; font-weight: 600; color: var(--ink); margin: 0; letter-spacing: -0.01em; }}
-  h1 {{ font-size: 36px; line-height: 1.1; margin-bottom: 10px; }}
+  h1 {{ font-size: 36px; line-height: 1.1; margin-bottom: 8px; }}
+  .period {{ font-family: 'EB Garamond', Georgia, serif; font-size: 22px; color: var(--ink);
+             font-weight: 500; margin: 0 0 4px; }}
   h2 {{ font-size: 24px; margin-top: 52px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }}
   h3 {{ font-size: 18px; margin-top: 24px; margin-bottom: 10px; }}
   p, li {{ font-size: 15px; color: var(--ink); }}
@@ -749,6 +762,8 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
   table.data td.q {{ font-family: 'EB Garamond', Georgia, serif; font-size: 16px; color: var(--ink); }}
   table.data.wide {{ font-size: 13px; }}
   table.data.wide td {{ padding: 8px 8px; }}
+  table.data tr.hi td {{ background: var(--accent-soft); }}
+  table.data tr.hi td:first-child strong {{ color: var(--accent); }}
   .op {{ font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--accent); }}
 
   .ds-grid {{ display: grid; grid-template-columns: minmax(0,1fr); row-gap: 4px; }}
@@ -765,39 +780,22 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
 
   <header>
     <h1>MoSPI MCP - Full Engagement Report</h1>
-    <p class="meta">{esc(period_str)} &middot; Generated {esc(generated)}</p>
+    <p class="period">{esc(period_str)}</p>
+    <p class="meta">Generated {esc(generated)}</p>
   </header>
 
   <div class="hero">
     <div class="hero-value">{fmt_int(agg["n_real"])}</div>
-    <div class="hero-label">tool calls in this window (excluding automated health checks)</div>
-    {probe_note}
+    <div class="hero-label">tool calls between {esc(start_date.strftime("%d %b %Y"))} and {esc(end_date.strftime("%d %b %Y"))}</div>
   </div>
 
-  <div class="kpis">{kpis_html}</div>
-
   <h2>{sec_matrix} &middot; Tool calls by client</h2>
-  <p>The primary view: who is using the MCP and which tools they hit. Counts are based
-     on the <span class="op">http.user_agent</span> tag on each trace.</p>
   {matrix_html}
-
-  {cpu_section_html}
 
   <h2>{sec_tooldist} &middot; Tool distribution overall</h2>
   {tool_chart}
 
-  <h2>{sec_dataset} &middot; Dataset usage</h2>
-  <p>Datasets touched across all real tool calls, restricted to the list of
-     known MoSPI sources.</p>
-  {dataset_chart}
-  {junk_note}
-
-  <h3>Top datasets per client</h3>
-  {ds_per_client_html}
-
   <h2>{sec_queries} &middot; Top user queries</h2>
-  <p>Natural-language questions sent on the <span class="op">tool.input.user_query</span> field, ranked by frequency.
-     {fmt_int(agg["n_with_query"])} of {fmt_int(agg["n_real"])} tool calls carried a written query.</p>
   {queries_html}
 
   <h2>{sec_time} &middot; Activity over time</h2>
@@ -809,8 +807,9 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
   {daily_chart}
 
   <h2>{sec_reliab} &middot; Reliability and latency</h2>
-  <p>Per-tool latency percentiles, error counts, and bytes returned.</p>
   {lat_table}
+
+  {cpu_section_html}
 
   <div class="footer">
     {esc(period_str)} &middot; Generated {esc(generated)}
@@ -824,7 +823,54 @@ def render_html(calls, agg, syslog_samples, start_date, end_date, top_n):
 # Email
 # ---------------------------------------------------------------------------
 
-def send_email(args, html_doc, subject, attachment_path):
+def html_to_pdf(html_path, pdf_path):
+    """Render an HTML file to PDF. Tries headless Chromium, then wkhtmltopdf.
+    Returns pdf_path on success, None if no renderer is available / it fails."""
+    html_abs = os.path.abspath(html_path)
+    pdf_abs  = os.path.abspath(pdf_path)
+
+    # 1. Headless Chromium / Chrome
+    candidates = ["chromium", "chromium-browser", "google-chrome",
+                  "google-chrome-stable", "/snap/bin/chromium"]
+    for name in candidates:
+        exe = name if (os.path.isabs(name) and os.path.exists(name)) else shutil.which(name)
+        if not exe:
+            continue
+        for headless in ("--headless=new", "--headless"):
+            try:
+                r = subprocess.run(
+                    [exe, headless, "--disable-gpu", "--no-sandbox",
+                     "--no-pdf-header-footer", "--virtual-time-budget=10000",
+                     f"--print-to-pdf={pdf_abs}", f"file://{html_abs}"],
+                    capture_output=True, timeout=120,
+                )
+                if r.returncode == 0 and os.path.exists(pdf_abs) and os.path.getsize(pdf_abs) > 0:
+                    print(f"[pdf] rendered via {exe} {headless}", file=sys.stderr)
+                    return pdf_path
+            except Exception:
+                continue
+
+    # 2. wkhtmltopdf fallback
+    wk = shutil.which("wkhtmltopdf")
+    if wk:
+        try:
+            r = subprocess.run(
+                [wk, "--quiet", "--enable-local-file-access", html_abs, pdf_abs],
+                capture_output=True, timeout=120,
+            )
+            if r.returncode == 0 and os.path.exists(pdf_abs) and os.path.getsize(pdf_abs) > 0:
+                print(f"[pdf] rendered via wkhtmltopdf", file=sys.stderr)
+                return pdf_path
+        except Exception:
+            pass
+
+    print("[pdf] no working HTML-to-PDF renderer found", file=sys.stderr)
+    return None
+
+
+def send_email(args, body, body_subtype, subject, attachment_paths):
+    """body_subtype: 'plain' or 'html'.
+    attachment_paths: list of (path, subtype) tuples."""
     recipients = [r.strip() for r in args.email.split(",") if r.strip()]
     if not recipients:
         return False
@@ -832,12 +878,13 @@ def send_email(args, html_doc, subject, attachment_path):
     msg["Subject"] = subject
     msg["From"]    = args.from_addr
     msg["To"]      = ", ".join(recipients)
-    msg.attach(MIMEText(html_doc, "html", "utf-8"))
-    if attachment_path:
-        with open(attachment_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="html")
+    msg.attach(MIMEText(body, body_subtype, "utf-8"))
+    for path, subtype in attachment_paths or []:
+        if not path: continue
+        with open(path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype=subtype)
         att.add_header("Content-Disposition", "attachment",
-                       filename=Path(attachment_path).name)
+                       filename=Path(path).name)
         msg.attach(att)
     try:
         with smtplib.SMTP(args.smtp_host, args.smtp_port, timeout=30) as s:
@@ -898,11 +945,52 @@ def main():
     out_path.write_text(html_doc)
     print(f"[write] {out_path}  ({out_path.stat().st_size:,} bytes)", file=sys.stderr)
 
+    # CSV companion: just the natural-language queries, no automated probes
+    csv_path = out_path.with_suffix(".csv")
+    n_query_rows = 0
+    with csv_path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp_ist", "client", "dataset", "user_query"])
+        for c in calls:
+            if not c["user_query"]:
+                continue
+            if c["user_query"].strip().lower() in EXCLUDED_QUERIES:
+                continue
+            w.writerow([
+                c["ts"].astimezone(TZ_IST).strftime("%Y-%m-%d %H:%M:%S"),
+                c["client"], c["dataset"], c["user_query"],
+            ])
+            n_query_rows += 1
+    print(f"[write] {csv_path}  ({csv_path.stat().st_size:,} bytes, {n_query_rows} queries)", file=sys.stderr)
+
+    # Render a PDF of the report (unless disabled)
+    pdf_path = None
+    if not args.no_pdf:
+        pdf_path = html_to_pdf(out_path, out_path.with_suffix(".pdf"))
+        if pdf_path:
+            print(f"[write] {pdf_path}  ({Path(pdf_path).stat().st_size:,} bytes)", file=sys.stderr)
+
     if args.email:
         subject = args.subject or (
             f"MoSPI MCP weekly report - {start_date} to {end_date}"
         )
-        send_email(args, html_doc, subject, out_path)
+        if pdf_path:
+            # PDF mode: plain-text body, PDF + CSV attached
+            body = (
+                f"MoSPI MCP weekly engagement report for {start_date} to {end_date}.\n\n"
+                f"Attached:\n"
+                f"  - {Path(pdf_path).name}  (the report)\n"
+                f"  - {csv_path.name}  (all user queries in the window)\n\n"
+                f"This is an automated email.\n"
+            )
+            send_email(args, body, "plain", subject,
+                       [(pdf_path, "pdf"), (csv_path, "csv")])
+        else:
+            # Fallback: no PDF renderer available, send HTML as before
+            print("[email] PDF unavailable, falling back to HTML body + attachment",
+                  file=sys.stderr)
+            send_email(args, html_doc, "html", subject,
+                       [(out_path, "html"), (csv_path, "csv")])
 
 
 if __name__ == "__main__":
